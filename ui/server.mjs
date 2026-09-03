@@ -2735,6 +2735,9 @@ app.get('/api/workspaces/:id/runs/:runId/artifact', async (req, res) => {
 //   projectsRootDefault : what applies when projectsRoot is blank — the env tier
 //                         when exported, else defaultRoot(). The UI placeholder.
 //                         Additive; `default` keeps its `root` meaning.
+//   app                 : { version, repoUrl } — static identity for the About
+//                         card, from package.json. GET-only: it is not a setting,
+//                         so POST keeps echoing settingsState() + chat unchanged.
 // POST /api/settings -> set either key and return the resulting full state.
 //   Only keys PRESENT in the body are written, so a projectsRoot-only POST can
 //   never reset `root` (and vice versa). An explicitly empty value still resets
@@ -2744,6 +2747,26 @@ app.get('/api/workspaces/:id/runs/:runId/artifact', async (req, res) => {
 // Validation lives in src/core/settings.mjs; this is thin delegation mirroring
 // /api/projects.
 // ---------------------------------------------------------------------------
+// About card (Settings ▸ About): static app identity, read once at module load
+// from the package manifest — the same createRequire pattern as
+// src/core/ask/mcp-stdio.mjs:31, so a release bump is picked up with no code
+// change and nothing hardcodes a version. npm ships package.json in every tarball
+// (it needs no "files" entry), so `../package.json` resolves in the installed
+// package exactly as it does in-repo; a browser-side fetch of package.json would
+// NOT, since it lives outside ui/public.
+// `repository.url` is npm's git form ("git+https://….git"); normalise it to the
+// browsable https URL before it reaches the client.
+const PKG = require('../package.json');
+const repoWebUrl = (raw) => String(raw || '')
+  .replace(/^git\+/, '')
+  .replace(/^ssh:\/\/git@/, 'https://')
+  .replace(/^git:\/\//, 'https://')
+  .replace(/\.git$/, '');
+const APP_INFO = Object.freeze({
+  version: PKG.version || '',
+  repoUrl: repoWebUrl(PKG.repository && PKG.repository.url),
+});
+
 const settingsState = () => ({
   root: getWorcaRoot(), projectsRoot: rawProjectsRoot(),
   projectsRootDefault: defaultProjectsRoot(), default: defaultRoot(),
@@ -2755,7 +2778,7 @@ const settingsState = () => ({
 });
 
 app.get('/api/settings', (_req, res) => {
-  res.json({ ...settingsState(), chat: chatPrefs() });
+  res.json({ ...settingsState(), chat: chatPrefs(), app: APP_INFO });
 });
 
 app.get('/api/budget', (_req, res) => {

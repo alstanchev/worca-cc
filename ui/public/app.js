@@ -295,6 +295,10 @@ const el = {
   chatSettingsMsg: $('#chatSettingsMsg'),
   settingsTabs: $('#settings-tabs'),
 
+  // About (Settings card): read-only app identity, painted from /api/settings
+  aboutVersion: $('#aboutVersion'),
+  aboutRepoLink: $('#aboutRepoLink'),
+
   // Guardrails view
   guardrailsList: $('#guardrails-list'),
   guardrailsMsg: $('#guardrails-msg'),
@@ -7673,6 +7677,24 @@ function paintSettings(data) {
 // fallback so an older/partial response still fills the placeholder.
 const projectsRootFallback = (data) => data.projectsRootDefault || data.default || '';
 
+// About card: read-only app identity (version + repo URL) taken straight from
+// package.json and served under `app` by GET /api/settings — nothing here or in
+// index.html hardcodes a version. A payload WITHOUT `app` (an older server, or a
+// POST echo, which deliberately omits it) leaves the static markup in place
+// rather than blanking the card. target/rel live in the HTML and are never
+// touched here, so the link can't lose its safety attributes on a repaint.
+// The repoUrl type check is not paranoia: paintAbout runs early in loadSettings,
+// so a throw here would skip every paint after it — the whole Settings view lost
+// to a fault in its least important card.
+function paintAbout(info) {
+  if (!info) return;
+  if (el.aboutVersion && info.version) el.aboutVersion.textContent = info.version;
+  if (el.aboutRepoLink && typeof info.repoUrl === 'string' && info.repoUrl) {
+    el.aboutRepoLink.href = info.repoUrl;
+    el.aboutRepoLink.textContent = info.repoUrl.replace(/^https?:\/\//, '');
+  }
+}
+
 async function loadSettings() {
   if (!el.settingsRoot) return;
   try {
@@ -7680,6 +7702,7 @@ async function loadSettings() {
     const data = await safeJson(res);
     if (!res.ok) { setSettingsMsg(data.error || `HTTP ${res.status}`, 'err'); return; }
     paintSettings(data);
+    paintAbout(data.app);
     paintBudgetSettings(data);
     paintAskSettings(data);
     paintBudgetReadout();

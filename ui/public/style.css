@@ -1527,9 +1527,25 @@ fieldset.source legend{font-weight:600;font-size:13px;padding:0 6px;color:var(--
 .topnav button.active .topnav-amt{color:inherit;}
 
 /* ---------- Settings cards ---------- */
-/* One width/centering/gap rule for all three Settings cards. */
+/* One width/centering/gap rule for every Settings card. */
 .settings-card{max-width:760px;padding:22px;margin-left:auto;margin-right:auto;}
 .settings-card + .settings-card{margin-top:18px;}
+
+/* About card: the app's only static label/value rows. Nothing existing fits —
+   .field is for inputs, .hint must stay empty in this view, and .stat-* are the
+   Stats-view number tiles. Tokens only, no new colour literals (ui-theme.test.mjs
+   :61-72 pins six hexes at one occurrence each). The link matches .hist-pr-link /
+   .hd-pr-link (green ink, underline on hover).
+   ORDER MATTERS: .about-val and .about-link have equal specificity (0,1,0) and the
+   anchor carries both, so .about-link must stay AFTER .about-val or the link goes
+   grey. Keep these rules together and in this order. */
+.about-row{display:flex;align-items:baseline;gap:10px;font-size:13px;}
+.about-row + .about-row{margin-top:10px;}
+.about-key{flex:0 0 96px;font-weight:600;color:var(--ink-2);}
+.about-val{color:var(--ink);min-width:0;}
+.about-version{font-family:var(--mono);}
+.about-link{color:var(--green-ink);font-weight:600;text-decoration:none;overflow-wrap:anywhere;}
+.about-link:hover{text-decoration:underline;}
 
 /* ---------- Budget readout (Settings) ---------- */
 /* Section gap before the limit fields (the disclaimer hint that used to sit
