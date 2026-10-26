@@ -92,3 +92,84 @@ test('run 4 D22: feed messages read as plain words; the raw detail is kept for t
   assert.deepEqual(plainFeedMessage('finished.'), { text: 'finished.', detail: '' });
   assert.deepEqual(plainFeedMessage('paused (something new): x'), { text: 'paused', detail: 'x' });
 });
+
+/** Mount with a fetch stub that answers by "METHOD path" and records every call. */
+async function mountWith(routes, deps = {}) {
+  const calls = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    const method = String(opts.method || 'GET').toUpperCase();
+    const key = `${method} ${String(url).split('?')[0]}`;
+    calls.push({ key, body: opts.body ? JSON.parse(opts.body) : undefined });
+    const body = routes[key] ?? (key === 'GET /api/schedules' ? routes.list : { notifications: [], unread: 0 });
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const host = () => document.createElement('div');
+  const hosts = { feedHost: host(), onceHost: host(), repeatingHost: host() };
+  document.body.replaceChildren(hosts.feedHost, hosts.onceHost, hosts.repeatingHost);
+  const view = createSchedulesView({ ...hosts, msgEl: document.createElement('p'),
+    deps: { confirmModal: async () => true, targetLabel: () => '', workflowLabel: () => '', ...deps } });
+  await view.load();
+  return { view, calls };
+}
+async function until(fn, ms = 2000) {
+  const end = Date.now() + ms;
+  for (;;) { const v = fn(); if (v) return v; if (Date.now() > end) throw new Error('timed out'); await new Promise((r) => setTimeout(r, 5)); }
+}
+const seriesOf = (id, extra = {}) => ({ id, kind: 'recurring', title: id, status: 'active', pauseReason: null, sentence: 'Every day at 02:00', tz: 'UTC',
+  rule: { freq: 'daily', time: '02:00', tz: 'UTC' }, overlap: 'skip', maxFailures: 3, failureStreak: 0, ifMissed: 'run', graceMin: 360, runsCount: 0,
+  nextRunAt: null, lastResult: null, createdBy: null, updatedBy: null, summary, ...extra });
+
+test('Models… shows on a waiting or missed one-off card and a repeating card; never on a resume, Auto, held or firing ticket, or an Auto series', async () => {
+  const tickets = [ticketAt('t_plain', 3600_000), ticketAt('t_missed', -3600_000, { status: 'missed' }),
+    ticketAt('t_resume', 3600_000, { resumePipelineId: 'p_1' }),
+    ticketAt('t_auto', 3600_000, { summary: { ...summary, workflowId: 'wf_auto' } }), ticketAt('t_held', 3600_000, { ownerPid: 4242 }),
+    ticketAt('t_firing', 3600_000, { status: 'firing' })];
+  const { view } = await mountWith({ list: { schedules: [seriesOf('sch_aaaa1111'), seriesOf('sch_bbbb2222', { summary: { ...summary, workflowId: 'wf_auto' } })], tickets, counts: {} } });
+  try {
+    const has = (id) => !!document.querySelector(`.sched-item[data-id="${id}"] .sched-models-btn`);
+    assert.deepEqual(['t_plain', 't_missed', 't_resume', 't_auto', 't_held', 't_firing', 'sch_aaaa1111', 'sch_bbbb2222'].map(has),
+      [true, true, false, false, false, false, true, false]);
+  } finally { view.destroy(); }
+});
+
+test('Models…: the click fetches the payload into a panel under the card; Save posts the diff, toasts and reloads', async () => {
+  const PAYLOAD = { kind: 'once', id: 't_plain', title: 't_plain', status: 'scheduled', fields: ['model', 'effort', 'subagentModel'],
+    models: [{ id: 'claude-opus-5-5', label: 'Opus 5.5', efforts: ['medium', 'high'] }], efforts: ['medium', 'high'], subagents: true,
+    subagentModels: ['sonnet', 'opus'], subagentEfforts: [], preset: null, pendingTickets: 0,
+    stages: [{ nodeId: 'n_plan', key: 'planner', label: 'Planner', fanOut: true, model: '', effort: '', subagentModel: '', picked: false,
+      projectDefault: null, state: 'scheduled', switchable: true }] };
+  const notes = [];
+  const { view, calls } = await mountWith({
+    list: { schedules: [], tickets: [ticketAt('t_plain', 3600_000)], counts: {} },
+    'GET /api/schedules/t_plain/models': PAYLOAD,
+    'POST /api/schedules/t_plain/models': { ok: true, kind: 'once', id: 't_plain', changed: [{ nodeId: 'n_plan' }], warnings: [], pendingTickets: 0 },
+  }, { notify: (o) => notes.push(o) });
+  try {
+    document.querySelector('.sched-item[data-id="t_plain"] .sched-models-btn').click();
+    await until(() => document.querySelector('.sched-item[data-id="t_plain"] .sched-models .msw'));
+    const sel = document.querySelector('.sched-models tr[data-node="n_plan"] select[data-field="model"]');
+    sel.value = 'claude-opus-5-5'; sel.dispatchEvent(new window.Event('change'));
+    document.querySelector('.sched-models .msw-save').click();
+    const post = await until(() => calls.find((c) => c.key === 'POST /api/schedules/t_plain/models'));
+    assert.deepEqual(post.body, { changes: { n_plan: { model: 'claude-opus-5-5', effort: '' } } });
+    await until(() => notes.length);
+    assert.equal(notes[0].title, 'Switched 1 stage');
+    await until(() => !document.querySelector('.sched-models'));
+    assert.ok(calls.filter((c) => c.key === 'GET /api/schedules').length >= 2, 'reloaded after the save');
+  } finally { view.destroy(); }
+});
+
+test('a card with picks says "Agents: N picked" in its details; a "changed" feed entry renders as a blue Changed badge', async () => {
+  const picked = ticketAt('t_picked', 3600_000, { summary: { ...summary, agentPicks: 2 } });
+  const { view } = await mountWith({
+    list: { schedules: [], tickets: [picked], counts: {} },
+    'GET /api/notifications': { notifications: [{ id: 1, kind: 'changed', severity: 'info', title: 'Nightly', ticketId: 't_picked', scheduleId: null,
+      message: 'agent models changed: Planner → Opus 5.5 · high.', createdAt: new Date().toISOString(), unread: false, resolvedAt: null }], unread: 0 },
+  });
+  try {
+    assert.match(document.querySelector('.sched-item[data-id="t_picked"] .sched-details-body').textContent, /Agents2 picked/);   // label + value, no separator
+    const badge = document.querySelector('.sched-feed-kind .badge');
+    assert.equal(badge.textContent, 'Changed');
+    assert.ok(badge.classList.contains('blue'));
+  } finally { view.destroy(); }
+});

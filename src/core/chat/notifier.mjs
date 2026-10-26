@@ -114,11 +114,12 @@ export function createNotifier({ channelHost, getPrefs, chatContext, logger = ()
 
     /**
      * A scheduled-run notification. Run outcomes are skipped: the fired run's own
-     * done/error events already reached chat through attach().
+     * done/error events already reached chat through attach(). `changed` (a scheduled
+     * run's agent models were edited) is a feed-only record.
      */
     notifySchedule(notification) {
       try {
-        if (!notification || ['completed', 'run_error', 'run_paused', 'retrying'].includes(notification.kind)) return;
+        if (!notification || ['completed', 'run_error', 'run_paused', 'retrying', 'changed'].includes(notification.kind)) return;
         let prefs; try { prefs = getPrefs(); } catch { prefs = { notify: {} }; }
         if (prefs.notify?.schedule === false) return;
         deliver(renderSchedule(notification));

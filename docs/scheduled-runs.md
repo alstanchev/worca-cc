@@ -50,6 +50,7 @@ another system is referenced, and read when the run starts.
 | Source branch | ref validated | worktree cut from the tip at start |
 | Feature branch | name stored | a series appends `-YYYYMMDD` (plus `-HHMM` when it runs several times a day) so each occurrence has its own branch |
 | Models, run config, tools | — | resolved in preflight, as today |
+| Per-agent picks (overlay) | checked, stored | used as stored; change them any time before the start with **Models…** or `worca switch-model <id>` |
 | Total cost budget | warning only | enforced; a blocked budget fails the ticket |
 
 A workflow that asks questions behaves exactly as designed: an unattended run waits
@@ -153,6 +154,12 @@ moves past the gap; one that occurs twice fires once.
   pauses itself and says so. Every failure is reported either way.
 - Editing a schedule **replaces** its pending occurrence. *Run now* adds one extra
   occurrence; the series does not shift.
+- Changing its agents' models (**Models…**, `worca switch-model sch_…`) rewrites the
+  series and every waiting run it already queued **in place**: same run, same time. A
+  run that is already starting keeps its models. One run of a series cannot be changed
+  on its own. A schedule that follows a run preset keeps the edited picks: the preset's
+  agent picks, and the loop budgets that ride with them, no longer apply to it, while
+  its other choices still follow the preset.
 
 The rule maths, the sentence ("Every weekday at 02:00", "Every 15 minutes, 09:00–18:00, weekdays",
 "Every day at 09:00, 13:00 and 17:00") and the parsers live in
@@ -175,7 +182,11 @@ worca --prompt "Docs" --after 1a2b3c4d --after-any                    # even if 
 worca schedule list | show <id> | run-now <id> | move <id> --at "…"
 worca schedule move <id> --after <id>
 worca schedule cancel <id> | skip <id> | pause <id> | resume <id> | log [--unread]
+worca switch-model <id> | <sch_id> [--stage <s> | --all] --model … [--effort …] [--subagent-model …]
 ```
+
+`worca schedule show` lists each agent stage's pick (or *project default*);
+`worca switch-model <id>` lists and changes them (no sub-agent effort on a scheduled run).
 
 `--at` takes `02:00` (next occurrence), `today 22:00`, `tomorrow 02:00`, `+90m`,
 `2026-09-19 02:00`, or ISO 8601 with an offset — local time unless an offset is
@@ -214,6 +225,9 @@ PATCH  /api/schedules/:id         ticket: { scheduledFor?, ifMissed?, graceMin? 
 PATCH  /api/schedules/:id         ticket: { after?, afterPolicy?, sourceFromPrevious? }  (after OR scheduledFor)
 DELETE /api/schedules/:id         cancel a one-off ticket / delete a series
 POST   /api/schedules/:id/run-now | skip-next | pause | resume
+GET    /api/schedules/:id/models    the agent stages, their stored picks, project defaults and the catalog the run's engine offers
+POST   /api/schedules/:id/models    { changes: { <nodeId>: { model?, effort?, subagentModel? } } }   ('' clears)
+                                    -> { ok, kind, id, changed, overlay, warnings, pendingTickets }
 POST   /api/schedules/preview     { rule, count? } -> { rule, sentence, next[] }
 GET    /api/schedules/dependents?workflowId=|projectDir=|workspaceId=
 GET    /api/schedules/dependents?pipelineId=|ticketId=
@@ -221,6 +235,11 @@ GET    /api/branches              + runs: [{ branch, pipelineId, title, status, 
 GET    /api/notifications?scope=schedule[&unread=1][&problems=1]
 POST   /api/notifications/:id/read { read? } · POST /api/notifications/read-all
 ```
+
+A refused `/models` call answers `{ error, code }`, with `code` one of `NOT_FOUND`,
+`NOT_SCHEDULABLE`, `OCCURRENCE`, `RESUME_TICKET`, `HELD_BY_TERMINAL`, `AUTO_WORKFLOW`,
+`SCAN_TARGET`, `WORKFLOW_GONE`, `ENGINE_UNKNOWN`, `UNKNOWN_STAGE`, `BAD_FIELD`,
+`BAD_REQUEST`, `INVALID_SELECTION` or `CHANGED`.
 
 Without `scheduledFor`/`repeat`, `POST /api/run` answers `200 { runId }` exactly as
 before. `GET /api/runs` gains an additive `scheduled: []`; `GET /api/counts` gains
@@ -243,12 +262,14 @@ the caller's zone — and so is a time in the past.
   reads as **Schedule**, so describing the task and one click schedules it. The pick is
   never persisted — a reload is a plain form — and the menu's *Start run now* ignores it.
 - **Schedules** (sidebar), three tabs routed as `#schedules[/once|/repeating]`:
-  **Activity** — the feed; **Once** — one-off runs with Run now, Change time, Cancel;
-  **Repeating** — the series with Run now, Skip next, Edit, a pause switch and Delete.
+  **Activity** — the feed; **Once** — one-off runs with Run now, Change time, **Models…**, Cancel;
+  **Repeating** — the series with Run now, Skip next, Edit, **Models…**, a pause switch and Delete.
   Every card names its target first: *Project · shop* or *Workspace · Storefront*.
   Problems (missed, failed, paused itself, run error) count towards the amber unread
   badge and resolve themselves when you act on them; completed, late and skipped
   items arrive read. Notifications are purged after 90 days, ended tickets after 30.
+  **Models…** opens the Models panel; a card with picks says *Agents: N picked* in its details, and each change
+  leaves a quiet *Changed* item in the feed (never sent to chat).
 - **Running** shows what is due within 24 hours. **History** marks a run *Started by
   schedule*. **Settings › Runs › Scheduled runs** holds the defaults a new
   schedule inherits.

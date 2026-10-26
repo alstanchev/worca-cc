@@ -1311,6 +1311,7 @@ fieldset.source legend{font-weight:600;font-size:13px;padding:0 6px;color:var(--
 .msw-state{color:var(--ink-3);font-size:11px;}
 .msw-state.st-paused{color:var(--red-ink);}
 .msw-state.st-running{color:var(--ink-2);font-weight:500;}
+.msw-default{color:var(--ink-3);font-size:11px;}
 .msw-na{color:var(--ink-3);}
 .msw-all-row td{border-bottom:1px dashed var(--line);padding-bottom:8px;}
 .msw-error{color:var(--red-ink);font-size:12px;margin-top:6px;}
@@ -6853,6 +6854,8 @@ html{scrollbar-color:var(--line-2) transparent;scrollbar-width:thin;}
   margin-top:14px;padding-top:12px;border-top:1px solid var(--line);}
 .sched-acts{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px;margin-left:auto;}
 .sched-acts [hidden]{display:none;}
+.sched-models{margin-top:10px;}
+.sched-models .msw{margin:0;}
 .sched-sub{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin-top:9px;font-size:var(--fs-meta);color:var(--ink-2);}
 .sched-when{font-variant-numeric:tabular-nums;}
 .sched-sub .sched-when{font-weight:600;color:var(--ink);}

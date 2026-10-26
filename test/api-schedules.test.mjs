@@ -578,3 +578,94 @@ test('GET /api/schedules carries the open "Run after" chains, and drops a chain 
   const settledChains = await get('/api/schedules');
   assert.equal(settledChains.chains.some((c) => c.id === 'p:ch000001'), false);
 });
+
+test('Models…: GET describes a ticket; POST stores a pick and bumps summary.agentPicks; 400 with the checker\'s message; 409 on a fired ticket', async () => {
+  const made = await (await post('/api/run', { projectDir: dir, prompt: 'models', title: 'Models', mock: true, scheduledFor: inFuture(3600_000) })).json();
+  const g = await call('GET', `/api/schedules/${made.runId}/models`);
+  assert.equal(g.status, 200, await g.clone().text());
+  const payload = await g.json();
+  assert.deepEqual([payload.kind, payload.id, payload.status, payload.engine], ['once', made.runId, 'scheduled', 'claude']);
+  assert.deepEqual(payload.fields, ['model', 'effort', 'subagentModel']);
+  assert.deepEqual(payload.stages.map((s) => s.nodeId), ['n_clarify', 'n_plan', 'n_refine', 'n_impl', 'n_review']);
+  assert.ok(payload.stages.every((s) => s.state === 'scheduled' && s.switchable && !s.picked));
+  assert.equal((await get('/api/schedules')).tickets.find((t) => t.id === made.runId).summary.agentPicks, undefined);
+
+  const p = await post(`/api/schedules/${made.runId}/models`, { changes: { n_plan: { model: 'claude-opus-5-5', effort: 'high' } } });
+  assert.equal(p.status, 200, await p.clone().text());
+  assert.deepEqual((await p.json()).changed.map((c) => c.nodeId), ['n_plan']);
+  assert.equal((await get('/api/schedules')).tickets.find((t) => t.id === made.runId).summary.agentPicks, 1);
+  assert.equal((await get(`/api/schedules/${made.runId}`)).notifications.filter((n) => n.kind === 'changed').length, 1);
+
+  const bad = await post(`/api/schedules/${made.runId}/models`, { changes: { n_plan: { model: 'gpt-5.5' } } });
+  assert.equal(bad.status, 400);
+  const badBody = await bad.json();
+  assert.equal(badBody.code, 'INVALID_SELECTION');
+  assert.match(badBody.error, /node "n_plan": gpt-5\.5 runs on Codex, not on Claude/);
+
+  getDb().prepare("UPDATE scheduled_runs SET status = 'fired' WHERE id = ?").run(made.runId);
+  const fired = await post(`/api/schedules/${made.runId}/models`, { changes: { n_plan: { model: '' } } });
+  assert.equal(fired.status, 409);
+  assert.equal((await fired.json()).code, 'NOT_SCHEDULABLE');
+  const nope = await call('GET', '/api/schedules/nope/models');
+  assert.deepEqual([nope.status, (await nope.json()).code], [404, 'NOT_FOUND']);
+});
+
+test('Models…: a series edit answers pendingTickets; its occurrence is refused by ticket id', async () => {
+  const made = await (await post('/api/run', { projectDir: dir, prompt: 'Nightly models', title: 'Nightly models', mock: true,
+    repeat: { rule: { freq: 'daily', time: '02:00', tz: 'UTC' } } })).json();   // overlap defaults to 'skip'; the route adds the anchor
+  const out = await (await post(`/api/schedules/${made.scheduleId}/models`, { changes: { n_impl: { model: 'claude-opus-5-5' } } })).json();
+  assert.deepEqual([out.kind, out.pendingTickets], ['recurring', 1]);
+  const occ = await call('GET', `/api/schedules/${made.runId}/models`);
+  assert.deepEqual([occ.status, (await occ.json()).code], [400, 'OCCURRENCE']);
+  await call('DELETE', `/api/schedules/${made.scheduleId}`);
+});
+
+// The save announces itself ('updated'); the tick's probe must not echo it 30 s later as 'external', whose repaint
+// drops a Models panel the user reopened meanwhile. A real outside write still reads 'external' (the control).
+test('Models…: a save is not echoed by the next tick as an external change', async () => {
+  const mod = await import('../ui/server.mjs');
+  const { WebSocket } = await import('ws');
+  const made = await (await post('/api/run', { projectDir: dir, prompt: 'Echo', title: 'Echo', mock: true, scheduledFor: inFuture(3600_000) })).json();
+  await new Promise((r) => mod.server.listen(0, '127.0.0.1', r));
+  try {
+    const ws = new WebSocket(`ws://127.0.0.1:${mod.server.address().port}/ws`, { headers: { host: '127.0.0.1', origin: 'http://127.0.0.1' } });
+    const frames = [];
+    await new Promise((res, rej) => {
+      ws.on('message', (d) => { const m = JSON.parse(String(d)); frames.push(m); if (m.type === 'hello') res(); });
+      ws.on('error', rej);
+    });
+    await schedulerTick();   // the probe's baseline, after the create
+    const p = await post(`/api/schedules/${made.runId}/models`, { changes: { n_plan: { model: 'claude-opus-5-5' } } });
+    assert.equal(p.status, 200, await p.clone().text());
+    assert.deepEqual((await schedulerTick()).fired, [], 'a fired ticket would hide the echo');
+    getDb().prepare('UPDATE scheduled_runs SET updated_at = ? WHERE id = ?').run(new Date(Date.now() + 60_000).toISOString(), made.runId);
+    await schedulerTick();
+    // A second announced save closes the window: every frame the two ticks sent arrives between the two 'updated'.
+    assert.equal((await post(`/api/schedules/${made.runId}/models`, { changes: { n_plan: { model: '' } } })).status, 200);
+    const ofSchedules = () => frames.filter((f) => f.type === 'schedules-changed').map((f) => f.action);
+    await until(() => ofSchedules().filter((a) => a === 'updated').length === 2);
+    const seq = ofSchedules();
+    const from = seq.indexOf('updated');
+    assert.deepEqual(seq.slice(from, seq.indexOf('updated', from + 1) + 1), ['updated', 'external', 'updated'], 'one external frame: the outside write');
+    ws.close();
+  } finally {
+    await new Promise((r) => mod.server.close(r));
+  }
+  await call('DELETE', `/api/schedules/${made.runId}`);
+});
+
+test('Models… end to end: a pick saved on a waiting ticket is what its fired run runs (design §9.1)', { timeout: 120000 }, async () => {
+  const made = await (await post('/api/run', { projectDir: dir, prompt: 'Picked', title: 'Picked', mock: true, scheduledFor: inFuture(3600_000) })).json();
+  const p = await post(`/api/schedules/${made.runId}/models`, { changes: { n_plan: { model: 'claude-opus-5-5', effort: 'high' } } });
+  assert.equal(p.status, 200, await p.clone().text());
+  assert.equal((await (await post(`/api/schedules/${made.runId}/run-now`)).json()).status, 'fired');
+  const entry = await untilSettled(made.runId);   // the ticket id IS the runId
+  assert.equal(entry.status, 'done');
+  // The frozen manifest, read as test/api-run-overlay.test.mjs reads it (entry.orch.getState().stepper); the row's
+  // `stepper` column (artifacts.mjs writeState) holds the same copy and is the fallback.
+  const stepper = entry.orch?.getState?.().stepper
+    || JSON.parse(getDb().prepare('SELECT stepper FROM pipelines WHERE id = ?').get(entry.pipelineId).stepper);
+  const plan = stepper.graph.nodes.find((n) => n.id === 'n_plan');
+  assert.deepEqual([plan.model, plan.effort], ['claude-opus-5-5', 'high']);
+  assert.deepEqual(stepper.runOverlay.nodes.n_plan, { model: 'claude-opus-5-5', effort: 'high' });
+});

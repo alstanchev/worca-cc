@@ -11,7 +11,8 @@ import { graphResumePoint } from './helpers/graph-templates.mjs';
 import { addProject } from '../src/core/projects.mjs';
 import { readPipelineForResume } from '../src/core/artifacts.mjs';
 import { getDb } from '../src/core/db.mjs';
-import { parseSwitchArgs } from '../src/cli/switch-model.mjs';
+import { parseSwitchArgs, resolveSwitchRef } from '../src/cli/switch-model.mjs';
+import { createTicket, createSchedule, getTicket, getSchedule } from '../src/core/scheduler.mjs';
 
 const CLI = fileURLToPath(new URL('../src/cli/worca-cc.mjs', import.meta.url));
 const home = useTempHome(after);
@@ -124,4 +125,75 @@ test('--model without --effort clears a stored effort the new model does not off
   const pair = (n) => { const x = nodes.find((y) => y.id === n); return [x.model, x.effort]; };
   assert.deepEqual(['n_plan', 'n_refine', 'n_impl', 'n_review'].map(pair), [
     ['claude-haiku-4-5', ''], ['claude-haiku-4-5', ''], ['claude-haiku-4-5', 'high'], ['claude-haiku-4-5', '']]);
+});
+
+async function seedTicket(name, extra = {}) {
+  const dir = gitDir(name);
+  await addProject({ name, path: dir });
+  return createTicket({ title: name, projectDir: dir, runAtMs: Date.now() + 86400_000,
+    request: { projectDir: dir, prompt: name, workflowId: 'wf_default' }, ...extra });
+}
+
+test('a scheduled ticket: lists its stages as "scheduled", changes one by agent key; --json shape; --subagent-effort refused (design §5)', async () => {
+  const t = await seedTicket('cli-msw-ticket');
+  const list = await run(['switch-model', t.id]);
+  assert.equal(list.code, 0, list.stderr);
+  assert.match(list.stdout, /— scheduled, starts /);
+  assert.match(list.stdout, /n_plan\s+scheduled/);
+  const one = await run(['switch-model', t.id.slice(0, 8), '--stage', 'planner', '--model', 'claude-opus-5-5', '--effort', 'high', '--json']);
+  assert.equal(one.code, 0, one.stderr);
+  const j = JSON.parse(one.stdout);
+  assert.deepEqual(Object.keys(j).sort(), ['changed', 'id', 'kind', 'pendingTickets', 'warnings']);
+  assert.deepEqual([j.id, j.kind, j.pendingTickets, j.changed.map((c) => c.nodeId)], [t.id, 'once', 0, ['n_plan']]);
+  assert.deepEqual(getTicket(t.id, { withRequest: true }).request.overlay, { nodes: { n_plan: { model: 'claude-opus-5-5', effort: 'high' } } });
+  const human = await run(['switch-model', t.id, '--stage', 'planner', '--model', 'default']);
+  assert.equal(human.code, 0, human.stderr);
+  assert.match(human.stdout, /Changed Planner \(n_plan\): .*· high → project default/);
+  const sub = await run(['switch-model', t.id, '--stage', 'planner', '--subagent-effort', 'high']);
+  assert.equal(sub.code, 2);
+  assert.match(sub.stderr, /a scheduled run stores no sub-agent effort/);
+});
+
+test('a sch_ id: --all changes every stage of the series and its waiting run, in place', async () => {
+  const dir = gitDir('cli-msw-series');
+  await addProject({ name: 'cli-msw-series', path: dir });
+  const { schedule, ticket } = createSchedule({ title: 'Nightly', projectDir: dir, request: { projectDir: dir, prompt: 'n', workflowId: 'wf_default' },
+    rule: { freq: 'daily', time: '02:00', tz: 'UTC', anchor: '2026-10-01' } });   // createSchedule needs the anchor POST /api/run adds
+  const list = await run(['switch-model', schedule.id]);
+  assert.equal(list.code, 0, list.stderr);
+  assert.match(list.stdout, /— repeating schedule, /);
+  const r = await run(['switch-model', schedule.id, '--all', '--model', 'claude-sonnet-5-5']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /Changed Planner \(n_plan\)/);
+  assert.match(r.stdout, /Also updated 1 waiting run\./);
+  assert.equal(getSchedule(schedule.id, { withRequest: true }).request.overlay.nodes.n_impl.model, 'claude-sonnet-5-5');
+  assert.equal(getTicket(ticket.id, { withRequest: true }).request.overlay.nodes.n_impl.model, 'claude-sonnet-5-5', 'same ticket id: updated in place');
+  const occ = await run(['switch-model', ticket.id]);
+  assert.equal(occ.code, 1);
+  assert.match(occ.stderr, new RegExp(`worca switch-model ${schedule.id}`));
+});
+
+test('resolveSwitchRef: two series under one prefix read "schedules"; an id with no hit names the sch_ form', () => {
+  const dir = gitDir('cli-msw-ref');
+  for (const id of ['sch_d0d0aa01', 'sch_d0d0aa02']) {
+    createSchedule({ id, title: id, projectDir: dir, request: { projectDir: dir, prompt: 'r', workflowId: 'wf_default' },
+      rule: { freq: 'daily', time: '02:00', tz: 'UTC', anchor: '2026-10-01' } });
+  }
+  const fail = (msg) => { throw new Error(msg); };
+  assert.throws(() => resolveSwitchRef('sch_d0d0aa0', fail), /^Error: "sch_d0d0aa0" matches 2 schedules — use a longer id$/);
+  assert.deepEqual(resolveSwitchRef('sch_d0d0aa01', fail), { kind: 'recurring', id: 'sch_d0d0aa01' });
+  assert.throws(() => resolveSwitchRef('d0d0aa01', fail), /no run matches "d0d0aa01" .*a repeating schedule is named by its sch_ id/);
+});
+
+test('a prefix that matches a run and a scheduled run is refused; the full pipeline id still lists the run', async () => {
+  const pid = await seedPaused('cli-msw-amb');
+  const dir = gitDir('cli-msw-amb-t');
+  createTicket({ id: `${pid.slice(0, 6)}zz-0000-4000-8000-000000000000`, title: 'amb', projectDir: dir, runAtMs: Date.now() + 86400_000,
+    request: { projectDir: dir, prompt: 'amb' } });
+  const r = await run(['switch-model', pid.slice(0, 6)]);
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /matches a run and a scheduled run — use a longer id/);
+  const ok = await run(['switch-model', pid]);
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.match(ok.stdout, /— paused/);
 });

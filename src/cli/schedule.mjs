@@ -69,6 +69,7 @@ machine is awake.
 Commands:
   worca schedule list [--all]             Waiting runs and repeating schedules
   worca schedule show <id>                One item in detail
+  worca switch-model <id>                 Change a waiting run's agent models (see: worca switch-model help)
   worca schedule run-now <id>             Start it now (a repeating schedule gets one extra run)
   worca schedule move <id> --at <when>    Change the time of a one-off run
   worca schedule move <id> --after <id>   Wait for another run instead of a time
@@ -394,6 +395,24 @@ const where = (x) => (x.workspaceId ? `workspace ${x.workspaceId}` : (x.projectD
 // `list` drops the status: a regex strip of ` (…)` would also eat a title's own parentheses.
 const afterLabel = (t, { withStatus = true } = {}) => { const r = afterRefOf(t.after.id); return `‘${(r && r.title) || t.after.id.slice(0, 8)}’${withStatus && r ? ` (${r.status})` : ''}`; };
 
+/** `show`'s agents block (schedule-models.mjs): each agent stage's pick, or project default. An item whose models cannot
+ *  change (fired, a resume, held, an occurrence — its series shows them) prints none; the Auto workflow says why. `show`
+ *  is display-only and cannot fail once the item resolved, so ANY other error (the catalog, a preset file) prints no
+ *  block rather than crashing the command. */
+async function printAgents(id, { out }) {
+  const { describeScheduledModels, scheduledPickText } = await import('../core/schedule-models.mjs');
+  let info;
+  try { info = await describeScheduledModels(id); }
+  catch (err) {
+    if (err && err.code === 'AUTO_WORKFLOW') out('  agents     picked when the run starts (Auto workflow)');
+    return;
+  }
+  out('  agents');
+  const w = Math.max(0, ...info.stages.map((s) => s.label.length));
+  for (const s of info.stages) out(`    ${s.label.padEnd(w)}  ${s.picked ? scheduledPickText(s, info.models) : 'project default'}`);
+  if (info.preset && info.preset.overridden && !info.preset.missing) out(`  preset     these agent picks override the run preset ${info.preset.name}`);
+}
+
 export async function cmdSchedule(argv, { out, c, fail }) {
   const verb = argv[0];
   const rest = argv.slice(1);
@@ -469,6 +488,7 @@ export async function cmdSchedule(argv, { out, c, fail }) {
     if (!(kind === 'once' && item.after)) out(`  if missed  ${item.ifMissed === 'skip' ? 'skip' : `start late, within ${item.graceMin} min`}`);
     out(`  workflow   ${item.summary.workflowId}${item.summary.mock ? '  (mock)' : ''}`);
     if (item.summary.prompt) out(`  task       ${item.summary.prompt.split('\n')[0].slice(0, 100)}`);
+    await printAgents(item.id, { out });
     return 0;
   }
 

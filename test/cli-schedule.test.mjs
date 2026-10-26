@@ -268,3 +268,13 @@ test('enforced tags: --after with no --tag checks the tags the chain inherits an
     assert.equal(storedTags('Chain keeps parent'), undefined, 'a default never replaces the inherited tags');
   } finally { writeHomeSettings({}); }
 });
+
+test('worca schedule show prints the agents block: a pick, or project default', async () => {
+  const t = createTicket({ title: 'Agents block', projectDir: proj, runAtMs: Date.now() + 30 * 86400_000,
+    request: { projectDir: proj, prompt: 'agents', workflowId: 'wf_default', overlay: { nodes: { n_plan: { model: 'claude-opus-5-5', effort: 'high' } } } } });
+  const r = await run(['schedule', 'show', t.id.slice(0, 8)]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /\n {2}agents\n/);
+  assert.match(r.stdout, /\n {4}Planner +.+ · high\n/);
+  assert.match(r.stdout, /\n {4}Clarify +project default\n/);
+});

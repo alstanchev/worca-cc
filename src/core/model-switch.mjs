@@ -60,9 +60,9 @@ export function assertPerStageModels(normalized, modelForAll) {
 /** The engine a saved point runs on (run-harness.mjs savedEngine's rule: a missing engine is Claude). */
 const engineOfPoint = (rp) => (typeof rp?.claude?.engine === 'string' && rp.claude.engine) || 'claude';
 /** The effort vocabulary of `engine` (connections.mjs HARNESS_EFFORTS; an unknown engine falls back to Claude's). */
-const effortsOfEngine = (engine) => HARNESS_EFFORTS[engine] || EFFORTS;
+export const effortsOfEngine = (engine) => HARNESS_EFFORTS[engine] || EFFORTS;
 /** Whether `engine` runs sub-agents (engines/*.mjs capabilities: only a literal false degrades). */
-function engineHasSubagents(engine) {
+export function engineHasSubagents(engine) {
   try { return getEngine(engine).capabilities?.subagents !== false; } catch { return true; }
 }
 

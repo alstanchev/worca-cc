@@ -397,14 +397,23 @@ worca models set openrouter apiKey='${OPENROUTER_KEY}'   # openai provider → O
 
 A `worca --model copilot-gpt-5 --prompt …` run starts its own bridge.
 
-## Switch models on a running or paused run
+## Switch models on a scheduled, running or paused run
 
 A run's models are frozen when it starts. You can change the models of the stages it has not run
 yet — while it runs, or after it paused on a model problem (an exhausted usage limit, a model that
-went away).
+went away). A run that is only scheduled can have them changed before it starts, too.
 
 - **When.** While the run is **running** or **paused**. A pausing, interrupted, stopped, finished
   or archived run is refused.
+- **Scheduled run.** A one-off scheduled run, or a repeating schedule, can have the model, effort and
+  sub-agent model of each agent stage changed before it starts: **Models…** on its Schedules card,
+  `worca switch-model <id | sch_id>`, or `GET/POST /api/schedules/:id/models`. The pick is stored with
+  the schedule and checked like a pick on the New run card: against the workflow, the model catalog
+  and the engine the run will start on. *Default* clears it back to the project's setting, which the
+  panel shows under each stage. A scheduled run stores no sub-agent effort. A repeating schedule's
+  change also updates the runs it already queued. A schedule that follows a run preset keeps the
+  edited picks instead of the preset's. Resume schedules (switch the paused run), the Auto workflow
+  and runs that are already starting are refused.
 - **What changes.** Model, effort, sub-agent model and sub-agent effort of every stage that is not
   running and not finished for good. The change applies to **this run only**; the template and the
   project's settings are untouched.

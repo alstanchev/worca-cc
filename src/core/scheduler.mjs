@@ -80,6 +80,13 @@ function removeStage(id) {
 
 // ── row mapping ──────────────────────────────────────────────────────────────
 
+const PICK_FIELDS = ['model', 'effort', 'subagentModel'];
+/** How many agent nodes of a stored overlay name a model, effort or sub-agent model (Models…, the card's "Agents: N picked"). */
+function agentPicksOf(overlay) {
+  const nodes = overlay && typeof overlay === 'object' && overlay.nodes && typeof overlay.nodes === 'object' ? overlay.nodes : {};
+  return Object.values(nodes).filter((n) => n && typeof n === 'object' && PICK_FIELDS.some((k) => typeof n[k] === 'string' && n[k])).length;
+}
+
 /** The display summary of a stored request — never the full prompt or file bodies. */
 export function summarizeRequest(req) {
   const r = req && typeof req === 'object' ? req : {};
@@ -97,6 +104,7 @@ export function summarizeRequest(req) {
     mock: !!r.mock,
     extras: Array.isArray(r.internal?.extrasPaths) ? r.internal.extrasPaths.length : 0,
     ...(r.sameAsSource === true ? { sameAsSource: true } : {}),
+    ...(agentPicksOf(r.overlay) ? { agentPicks: agentPicksOf(r.overlay) } : {}),
   };
 }
 
@@ -411,6 +419,24 @@ export function heartbeatTicket(id, { now = Date.now() } = {}) {
 export function releaseTicket(id, { now = Date.now() } = {}) {
   return getDb().prepare("UPDATE scheduled_runs SET owner_pid = NULL, owner_host = NULL, updated_at = ? WHERE id = ? AND status = 'scheduled'")
     .run(iso(now), String(id)).changes > 0;
+}
+
+/** A waiting ticket a request rewrite may touch: not started (scheduled, or missed — Run now can still start it) and not
+ *  held by a waiting `--wait` terminal, which starts the run from its own flags and leases the row through updated_at. */
+const EDITABLE_TICKET_SQL = "status IN ('scheduled', 'missed') AND owner_pid IS NULL";
+
+/**
+ * Rewrite what a waiting ticket fires, IN PLACE (Models…, src/core/schedule-models.mjs): only `request` changes — the
+ * id, time, attempts and policies stay. One guarded UPDATE, so a ticket the tick claimed meanwhile (`firing`) or a
+ * waiting terminal holds is never touched; `expectUpdatedAt` (the stamp the caller read) refuses a lost update.
+ * @returns {object|null} the ticket with its request, or null when it is not editable or changed meanwhile
+ */
+export function updateTicketRequest(id, request, { expectUpdatedAt = undefined, now = Date.now(), by = undefined } = {}) {
+  const guard = expectUpdatedAt === undefined ? '' : ' AND updated_at = ?';
+  const changed = getDb().prepare(`UPDATE scheduled_runs SET request = ?, updated_at = ?, updated_by = COALESCE(?, updated_by)
+    WHERE id = ? AND ${EDITABLE_TICKET_SQL}${guard}`)
+    .run(JSON.stringify(request || {}), iso(now), byOf(by), String(id), ...(expectUpdatedAt === undefined ? [] : [expectUpdatedAt])).changes;
+  return changed ? getTicket(id, { withRequest: true }) : null;
 }
 
 function markFired(id, pipelineId, now) {
@@ -880,6 +906,40 @@ export function materializeNext(scheduleId, { now = Date.now() } = {}) {
   return ticket;
 }
 
+/** The waiting tickets of a series a request rewrite reaches (EDITABLE_TICKET_SQL: forced, queued and missed ones too),
+ *  soonest first, with their requests. */
+export function editableSeriesTickets(scheduleId) {
+  return getDb().prepare(`SELECT id, request FROM scheduled_runs WHERE schedule_id = ? AND ${EDITABLE_TICKET_SQL} ORDER BY run_at ASC`)
+    .all(String(scheduleId)).map((r) => ({ id: r.id, request: parseJson(r.request, {}) }));
+}
+
+/**
+ * Rewrite what a series fires, IN PLACE (Models…): `schedules.request`, then every waiting ticket it already
+ * materialized — ids, times, attempts and owners stay, unlike updateSchedule, which replaces the pending occurrence.
+ * By default each ticket gets `request` verbatim; `ticketRequest(itsOwnRequest)` keeps per-ticket fields instead (it
+ * runs inside the transaction: no tx-opening helper, no addNotification). An ended series, or one changed since the
+ * caller read it (`expectUpdatedAt`), is refused. A firing ticket is never touched.
+ * @returns {{schedule:object, ticketIds:string[]}|null}
+ */
+export function rewriteSeriesRequest(id, request, { ticketRequest = () => request, expectUpdatedAt = undefined, now = Date.now(), by = undefined } = {}) {
+  const ts = iso(now);
+  const guard = expectUpdatedAt === undefined ? '' : ' AND updated_at = ?';
+  const ticketIds = tx(() => {
+    const changed = getDb().prepare(`UPDATE schedules SET request = ?, updated_at = ?, updated_by = COALESCE(?, updated_by)
+      WHERE id = ? AND status != 'ended'${guard}`)
+      .run(JSON.stringify(request || {}), ts, byOf(by), String(id), ...(expectUpdatedAt === undefined ? [] : [expectUpdatedAt])).changes;
+    if (!changed) return null;
+    const ids = [];
+    for (const t of editableSeriesTickets(id)) {
+      getDb().prepare(`UPDATE scheduled_runs SET request = ?, updated_at = ?, updated_by = COALESCE(?, updated_by) WHERE id = ? AND ${EDITABLE_TICKET_SQL}`)
+        .run(JSON.stringify(ticketRequest(t.request) || {}), ts, byOf(by), t.id);
+      ids.push(t.id);
+    }
+    return ids;
+  });
+  return ticketIds ? { schedule: getSchedule(id, { withRequest: true }), ticketIds } : null;
+}
+
 /**
  * Edit a schedule. A pending occurrence is REPLACED by one computed from the new
  * rule; a run that already started is untouched.
@@ -1176,6 +1236,10 @@ export async function runDueTickets({
     }
 
     if (!claimTicket(t.id, { pid, host, now })) continue; // another process won the race
+    // Fire what the row holds NOW, not the copy dueTickets() read before the earlier starts: a Models… edit
+    // (schedule-models.mjs) may have landed since. The claim made the row `firing`, so no edit lands after this.
+    const claimed = getTicket(t.id, { withRequest: true });
+    if (claimed) t.request = claimed.request;
     // A sub-daily catch-up: this late slot starts, the later ones that already passed do not.
     const passed = !t.forced && !t.queued && t.attempts === 0 && late > ON_TIME_SLACK_MS ? passedSlots(t, schedule, now) : { count: 0 };
     if (passed.count) {

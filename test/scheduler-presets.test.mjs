@@ -186,3 +186,26 @@ test('a ticket from an Ask card never fires on Permissive, whatever the preset r
   assert.match(now.failReason, /scheduled from Chat and the run preset "Loose" now resolves to Permissive guardrails/);
   assert.equal(now.pipelineId ?? null, null, 'no run was started');
 });
+
+test('Models… on a follower: the edited picks fire, every other setup key still follows the preset (design §8, §9.3)', { timeout: 120000 }, async () => {
+  const preset = await savePreset('Models edit', { guardrailsId: 'normal', overlay: { nodes: { n_plan: { model: 'claude-haiku-4-5' } } } });
+  const made = await scheduleFrom(preset);
+  const sw = await post(`/api/schedules/${made.runId}/models`, { changes: { n_impl: { model: 'claude-sonnet-4-6', effort: 'high' } } });
+  assert.equal(sw.status, 200, await sw.clone().text());
+  const { getTicket } = await import('../src/core/scheduler.mjs');
+  const stored = getTicket(made.runId, { withRequest: true }).request;
+  assert.ok(stored.internal.presetOverrides.includes('overlay'));
+  assert.equal('presetId' in stored, false);
+  // The preset changes after the edit: guardrails follow it, the frozen overlay does not.
+  const put = await send('PUT', `/api/presets/${preset.id}`, { setup: { ...preset.setup, guardrailsId: 'secure',
+    overlay: { nodes: { n_plan: { model: 'claude-opus-5-5' } } } }, basis: { projectDir: project.path } });
+  assert.equal(put.status, 200, await put.clone().text());
+  const fired = await runNow(made.runId);
+  assert.equal(fired.status, 'fired', JSON.stringify(fired));
+  const { readRunSetup } = await import('../src/core/run-presets-store.mjs');
+  const pid = await until(() => getTicket(made.runId)?.pipelineId);
+  const kept = await until(() => readRunSetup(pid)?.setup);
+  assert.equal(kept.guardrailsId, 'secure', 'a key the edit did not touch follows the preset');
+  assert.equal(kept.overlay.nodes.n_impl.model, 'claude-sonnet-4-6', 'the edited pick fires');
+  assert.equal(kept.overlay.nodes.n_plan.model, 'claude-haiku-4-5', 'the overlay is kept as edited: the preset\'s later n_plan pick does not apply');
+});

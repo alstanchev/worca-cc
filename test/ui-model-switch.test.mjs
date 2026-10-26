@@ -205,3 +205,58 @@ test('cursor: effort selects are disabled and sub-agent cells read em dashes', (
   assert.ok(row.querySelector('select[data-field="effort"]').disabled);
   assert.deepEqual([...row.querySelectorAll('td.msw-na')].map((t) => t.textContent), ['—', '—']);
 });
+
+const SCHED = {
+  kind: 'once', id: 't1', title: 'Nightly', status: 'scheduled', itemStatus: 'scheduled', engine: 'claude', workflowId: 'wf_default',
+  models: PAYLOAD.models, efforts: PAYLOAD.efforts, subagents: true, subagentModels: PAYLOAD.subagentModels, subagentEfforts: [],
+  fields: ['model', 'effort', 'subagentModel'], preset: null, pendingTickets: 0,
+  stages: [
+    { nodeId: 'n_plan', key: 'planner', label: 'Planner', fanOut: true, model: 'claude-fable-5-1', effort: 'xhigh', subagentModel: '', picked: true,
+      projectDefault: { model: 'claude-opus-5-5', effort: 'high', subagentModel: '' }, state: 'scheduled', switchable: true },
+    { nodeId: 'n_impl', key: 'implementer', label: 'Implementer', fanOut: false, model: '', effort: '', subagentModel: '', picked: false,
+      projectDefault: { model: '', effort: '', subagentModel: '' }, state: 'scheduled', switchable: true },
+  ],
+};
+
+test('a scheduled payload: fields hide the sub-agent effort column; picks() carries only the listed fields', () => {
+  const panel = renderModelSwitchPanel(SCHED, { doc });
+  assert.deepEqual([...panel.el.querySelectorAll('tr.msw-hrow th')].map((t) => t.textContent), ['Stage', 'Model', 'Effort', 'Sub-agents']);
+  assert.equal(panel.el.querySelectorAll('select[data-field="subagentEffort"]').length, 0);
+  assert.deepEqual(Object.keys(panel.picks().n_plan).sort(), ['effort', 'model', 'subagentModel']);
+  const all = panel.el.querySelector('tr.msw-all-row');
+  assert.equal(all.children.length, 4, 'one cell per column');
+  assert.equal(all.firstChild.textContent, 'All stages');
+  assert.equal(renderModelSwitchPanel(PAYLOAD, { doc }).el.querySelectorAll('tr.msw-hrow th').length, 5, 'a run payload keeps its five columns');
+});
+
+test('a scheduled payload: its own copy, the "scheduled" state, Save as the only action', async () => {
+  const calls = [];
+  const panel = renderModelSwitchPanel(SCHED, { doc, onSave: async (x) => { calls.push(x); } });
+  assert.equal(panel.el.dataset.mode, 'scheduled');
+  assert.equal(panel.el.querySelector('.msw-title').textContent, 'Models for this scheduled run');
+  assert.equal(panel.el.querySelector('.msw-sub').textContent, 'Each pick applies when the run starts. Default keeps the project\'s setting.');
+  assert.equal(panel.el.querySelector('tr[data-node="n_plan"] .msw-state').textContent, 'scheduled');
+  assert.equal(panel.el.querySelector('.msw-save-resume'), null);
+  assert.ok(panel.el.querySelector('.msw-save').classList.contains('btn-primary'));
+  const sel = panel.el.querySelector('tr[data-node="n_impl"] select[data-field="model"]');
+  sel.value = 'claude-opus-5-5'; sel.dispatchEvent(ev());
+  panel.el.querySelector('.msw-save').click();
+  await Promise.resolve();
+  assert.deepEqual(calls, [{ changes: { n_impl: { model: 'claude-opus-5-5', effort: '' } }, resume: false }]);
+  const series = renderModelSwitchPanel({ ...SCHED, kind: 'recurring', pendingTickets: 2 }, { doc }).el;
+  assert.equal(series.querySelector('.msw-title').textContent, 'Models for every run of this schedule');
+  assert.match(series.querySelector('.msw-sub').textContent, /Also updates 2 waiting runs\.$/);
+});
+
+test('a scheduled payload: the preset note, and the project default under each stage', () => {
+  const el = renderModelSwitchPanel({ ...SCHED, preset: { id: 'rp_x', name: 'Quick fix', overridden: false, missing: false } }, { doc }).el;
+  assert.equal(el.querySelector('.msw-note').textContent, 'Overrides the agent picks of the run preset Quick fix for this schedule.');
+  assert.equal(el.querySelector('tr[data-node="n_plan"] .msw-default').textContent, 'project: Opus 5.5 · high');
+  assert.equal(el.querySelector('tr[data-node="n_impl"] .msw-default').textContent, 'project: default');
+  assert.equal(renderModelSwitchPanel({ ...SCHED, preset: { id: 'rp_x', name: 'Gone', overridden: false, missing: true } }, { doc }).el.querySelector('.msw-note'), null);
+  assert.equal(renderModelSwitchPanel(PAYLOAD, { doc }).el.querySelector('.msw-default'), null, 'a run payload carries no project defaults');
+});
+
+test('switchNotice: a series edit names the waiting runs it also updated', () => {
+  assert.deepEqual(switchNotice({ changed: [{}], warnings: [], pendingTickets: 2 }), { tone: 'ok', title: 'Switched 1 stage', detail: 'Also updated 2 waiting runs.' });
+});

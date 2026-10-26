@@ -235,3 +235,14 @@ test('Watch PR: notifyPrWatch renders started/published as info and needs-person
   await settle();
   assert.equal(sent.length, 0);
 });
+
+test('notifySchedule: a "changed" entry (Models… on a scheduled run) stays in the feed, like completed; a missed run still reaches chat', async () => {
+  const { sent, settle, notifier } = fixture();
+  notifier.notifySchedule({ kind: 'changed', severity: 'info', title: 'Nightly', message: 'agent models changed: Planner → Opus 5.5 · high.' });
+  notifier.notifySchedule({ kind: 'completed', severity: 'info', title: 'Nightly', message: 'finished.' });
+  await settle();
+  assert.equal(sent.length, 0);
+  notifier.notifySchedule({ kind: 'missed', severity: 'problem', title: 'Nightly', message: 'was missed.' });
+  await settle();
+  assert.equal(sent.length, 2, 'one per chat id');
+});

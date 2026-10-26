@@ -17,6 +17,7 @@ import { formatInstant, formatCountdown } from '../../src/shared/schedule/recurr
 import { openScheduleSheet, browserTimeZone } from './schedule-sheet.mjs';
 import { splitMessage } from './feedback.mjs';
 import { actionError, httpError } from './action-errors.mjs';
+import { renderModelSwitchPanel, switchNotice } from './model-switch.mjs';
 
 const ICON = {
   clock: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 7.5V12l3 2"></path></svg>',
@@ -28,7 +29,7 @@ const ICON = {
 const KIND = {
   missed: ['Missed', 'amber'], failed: ['Failed', 'red'], run_error: ['Error', 'red'], paused: ['Paused', 'amber'],
   run_paused: ['Paused', 'amber'], skipped: ['Skipped', 'grey'], late: ['Late', 'blue'], retrying: ['Retrying', 'grey'],
-  completed: ['Completed', 'green'], ended: ['Ended', 'grey'],
+  completed: ['Completed', 'green'], ended: ['Ended', 'grey'], changed: ['Changed', 'blue'],
 };
 const RESULT_WORD = { completed: 'completed', error: 'ended with an error', failed: 'could not start', missed: 'missed', skipped: 'skipped', paused: 'paused', stopped: 'stopped' };
 const RESULT_FAMILY = { completed: 'green', error: 'red', failed: 'red', missed: 'amber', skipped: 'grey', paused: 'amber', stopped: 'grey' };
@@ -176,6 +177,7 @@ export function createSchedulesView({ tabsHost = null, feedHost, onceHost, repea
       row('Guardrails', item.summary.guardrailsId && item.summary.guardrailsId !== 'permissive' ? item.summary.guardrailsId : ''),
       row('Preset', item.presetId ? (item.presetName ? `${item.presetName} (read when the run starts)`
         : `${item.presetGoneName || 'A preset'} (deleted: the next run will fail)`) : ''),
+      row('Agents', item.summary.agentPicks > 0 ? `${item.summary.agentPicks} picked` : ''),
       row('Extra files', item.summary.extras ? String(item.summary.extras) : ''),
       item.after ? null : row('If Worca is not running', item.ifMissed === 'skip' ? 'Skip it' : `Start it late, at most ${item.graceMin >= 60 && item.graceMin % 60 === 0 ? `${item.graceMin / 60} h` : `${item.graceMin} min`}`),
       item.kind === 'recurring' ? row('If the previous run is still going', { skip: 'Skip this one', queue: 'Wait, then start', start: 'Start anyway' }[item.overlap]) : null,
@@ -194,6 +196,51 @@ export function createSchedulesView({ tabsHost = null, feedHost, onceHost, repea
       more.setAttribute('aria-expanded', body.hidden ? 'false' : 'true');
     });
     return h('div', { class: 'sched-foot' }, more, acts);
+  }
+
+  /** Models… (src/core/schedule-models.mjs): the agents' picks of a waiting run, or null where they cannot change — the
+   *  Auto workflow (it picks at start), a resume ticket (switch the paused run instead) and a ticket a waiting terminal
+   *  holds (it starts the run from its own flags). The callers already leave it off a firing ticket and an ended series. */
+  function modelsButton(item) {
+    if (item.summary && item.summary.workflowId === 'wf_auto') return null;
+    if (item.kind !== 'recurring' && (item.resumePipelineId || item.ownerPid != null)) return null;
+    const b = h('button', { type: 'button', class: 'btn btn-sm sched-models-btn', text: 'Models…',
+      title: item.kind === 'recurring' ? 'Change the agents’ models for every run of this schedule' : 'Change the agents’ models for this run' });
+    b.addEventListener('click', () => { void openModels(item, b); });
+    return b;
+  }
+
+  /** Open the Models panel under the card (one at a time; a second click closes it). A load() repaint drops it (P19). */
+  async function openModels(item, btn) {
+    const card = btn.closest('.sched-item');
+    if (!card) return;
+    const wasOpen = !!card.querySelector(':scope > .sched-models');
+    for (const open of document.querySelectorAll('.sched-models')) open.remove();
+    if (wasOpen) return;
+    const host = h('div', { class: 'sched-models' }, h('div', { class: 'msw-loading', text: 'Loading models…' }));
+    card.append(host);
+    const url = `/api/schedules/${encodeURIComponent(item.id)}/models`;
+    let payload;
+    try { payload = await api('GET', url); }
+    catch (err) {
+      host.remove();
+      if (deps.notify) deps.notify(actionError('load the models', err)); else say(err.message, 'err');
+      return;
+    }
+    if (!host.isConnected) return;   // the card was repainted meanwhile
+    const panel = renderModelSwitchPanel(payload, {
+      doc: document,
+      onCancel: () => host.remove(),
+      onSave: async ({ changes }) => {
+        if (Object.keys(changes).length) {
+          const out = await api('POST', url, { changes });   // a refusal throws httpError (.message = the server's error): the panel shows it inline
+          if (deps.notify) deps.notify(switchNotice(out));
+        }
+        host.remove();
+        await load();
+      },
+    });
+    host.replaceChildren(panel.el);
   }
 
   function ticketRow(t) {
@@ -250,7 +297,8 @@ export function createSchedulesView({ tabsHost = null, feedHost, onceHost, repea
           }
           act(() => api('DELETE', `/api/schedules/${t.id}`), 'Schedule cancelled', missed ? 'dismiss the missed run' : 'cancel the waiting run');
         });
-        acts.append(move, cancel);
+        const models = modelsButton(t);
+        acts.append(move, ...(models ? [models] : []), cancel);
       }
     }
     if (!t.scheduleId && !missed) {
@@ -300,7 +348,8 @@ export function createSchedulesView({ tabsHost = null, feedHost, onceHost, repea
         const res = await openScheduleSheet({ mode: 'series', runTitle: s.title || '', defaults: model.defaults, initial: { rule: s.rule, overlap: s.overlap, maxFailures: s.maxFailures, ifMissed: s.ifMissed, graceMin: s.graceMin } });
         if (res) act(() => api('PATCH', `/api/schedules/${s.id}`, { rule: res.repeat.rule, overlap: res.repeat.overlap, maxFailures: res.repeat.maxFailures, ifMissed: res.ifMissed, graceMin: res.graceMin }), 'Schedule changed');
       });
-      acts.append(runNow, skip, edit);
+      const models = modelsButton(s);
+      acts.append(runNow, skip, edit, ...(models ? [models] : []));
     }
     const del = h('button', { type: 'button', class: 'btn btn-danger btn-sm', text: 'Delete' });
     del.addEventListener('click', async () => {

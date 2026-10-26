@@ -606,10 +606,12 @@ level and has no **Diff**, **Changes** or **Actions**.
 - **Schedules view** — sidebar **Schedules** (Advanced; shown at every level
   while anything is scheduled) with three tabs: **Activity**, a feed of every
   miss, failure, late start, skip and self-pause, whose problems raise an amber
-  badge; **Once** (Run now, Change time, Cancel); **Repeating** (Run now, Skip
-  next, Edit, a pause switch, Delete). Upcoming and missed runs also appear in
-  **Runs**; `worca schedule` (`list`, `show`, `run-now`, `move`, `cancel`,
-  `skip`, `pause`, `resume`, `log`) does the same from a terminal.
+  badge; **Once** (Run now, Change time, Models…, Cancel); **Repeating** (Run
+  now, Skip next, Edit, Models…, a pause switch, Delete). Upcoming and missed
+  runs also appear in **Runs**; `worca schedule` (`list`, `show`, `run-now`,
+  `move`, `cancel`, `skip`, `pause`, `resume`, `log`) does the same from a
+  terminal, and `worca switch-model <id | sch_id>` changes a scheduled run's
+  agent models.
 - **When runs start** — there is no daemon: a run starts while `worca ui` (or a
   `worca … --at … --wait` terminal) is up and the machine is awake. A slot missed
   by less than the grace window (6 h by default) starts late; past it, the run

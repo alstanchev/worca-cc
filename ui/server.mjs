@@ -30,6 +30,7 @@ import { selectRunEngine } from '../src/core/engines/index.mjs';
 import { mockSlowMs } from '../src/core/engines/mock.mjs';
 import { stopPausedRun, StopPausedError } from '../src/core/stop-paused.mjs';
 import { describeModelSwitch, switchRunModels, ModelSwitchError } from '../src/core/model-switch.mjs';
+import { describeScheduledModels, switchScheduledModels } from '../src/core/schedule-models.mjs';
 import {
   listPipelines, readPipeline, listAllPipelines, readPipelineByKey,
   enrichPipelinesPr, reconcileStaleRunning, foreignActiveWorkspaceRuns, readPipelineForResume, persistPrState, readPrState,
@@ -4332,6 +4333,25 @@ for (const verb of ['pause', 'resume', 'skip-next']) {
     res.status(r.status).json(r.body);
   });
 }
+
+// Models… on a scheduled run (src/core/schedule-models.mjs): a one-off ticket's or a repeating series' agent stages with
+// their stored picks, and the edit (a series also rewrites its waiting runs). Errors use the model-switch envelope.
+app.get('/api/schedules/:id/models', async (req, res) => {
+  try { res.json(await describeScheduledModels(req.params.id)); }
+  catch (err) { modelSwitchReply(res, err); }
+});
+app.post('/api/schedules/:id/models', async (req, res) => {
+  try {
+    const out = await switchScheduledModels(req.params.id, { changes: req.body?.changes, by: actorOf(req) });
+    if (out.changed.length) {
+      emitChanged('schedules-changed', 'updated');
+      emitChanged('notifications-changed');
+      // Announced above: re-baseline the tick's probe so its next pass does not repaint it again as 'external'.
+      _lastScheduleSig = scheduleSignature();
+    }
+    res.json(out);
+  } catch (err) { modelSwitchReply(res, err); }
+});
 
 /** The reader whose read state applies: a person on a shared deployment, else null (the global column). */
 function notifReader(req) {

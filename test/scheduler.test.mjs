@@ -16,6 +16,7 @@ import {
   scheduleCounts, summarizeRequest, RETRY_BACKOFF_MIN, AFTER_RUN_AT,
   afterRefOf, predecessorState, previousBranchesOf, dependentsOfRun, resolveAfterRef,
   chainBaseBranchesOf, stackedPrBaseOf, markTicketFired, cancelResumeTicketsFor, runChains, skipTicket,
+  updateTicketRequest, rewriteSeriesRequest,
 } from '../src/core/scheduler.mjs';
 import { projectKey } from '../src/core/store.mjs';
 import { listNotifications, unreadCount } from '../src/core/notifications.mjs';
@@ -1102,4 +1103,72 @@ test('a same-branch predecessor: the gate waits while its merge back is pending 
 test('summarizeRequest: sameAsSource only when set', () => {
   assert.equal(summarizeRequest({ sameAsSource: true }).sameAsSource, true);
   assert.equal('sameAsSource' in summarizeRequest({}), false);
+});
+
+test('summarizeRequest: agentPicks counts the nodes that name a model, effort or sub-agent model', () => {
+  assert.equal('agentPicks' in summarizeRequest({}), false, 'no pick: no key (the sameAsSource rule)');
+  assert.equal(summarizeRequest({ overlay: { nodes: { n_plan: { model: 'm', effort: '' }, n_impl: { fanOut: true }, n_review: { subagentModel: 'opus' } },
+    wires: { w5: { maxCycles: 2 } } } }).agentPicks, 2);
+});
+
+test('updateTicketRequest rewrites a waiting ticket in place; never a firing, held or changed one', () => {
+  const t = createTicket({ projectDir: DIR, title: 'A', runAtMs: T0 + HOUR, request: REQ, now: T0 });
+  getDb().prepare('UPDATE scheduled_runs SET attempts = 2 WHERE id = ?').run(t.id);
+  const next = { ...REQ, overlay: { nodes: { n_plan: { model: 'claude-opus-5-5', effort: 'high' } } } };
+  assert.equal(updateTicketRequest(t.id, next, { expectUpdatedAt: 'not-its-stamp', now: T0 + 1000 }), null, 'changed since the caller read it');
+  const w = updateTicketRequest(t.id, next, { expectUpdatedAt: getTicket(t.id).updatedAt, now: T0 + 1000, by: 'ada' });
+  assert.deepEqual(w.request, next);
+  assert.deepEqual([w.id, w.attempts, w.runAt, w.status, w.updatedBy], [t.id, 2, t.runAt, 'scheduled', 'ada']);
+  const missed = createTicket({ projectDir: DIR, title: 'M', runAtMs: T0 + HOUR, request: REQ, now: T0 });
+  getDb().prepare("UPDATE scheduled_runs SET status = 'missed' WHERE id = ?").run(missed.id);
+  assert.ok(updateTicketRequest(missed.id, next), 'a missed ticket can still be run now: editable');
+  const firing = createTicket({ projectDir: DIR, title: 'F', runAtMs: T0 + HOUR, request: REQ, now: T0 });
+  assert.ok(claimTicket(firing.id, { now: T0 + HOUR }));
+  assert.equal(updateTicketRequest(firing.id, next), null, 'the tick claimed it');
+  const held = createTicket({ projectDir: DIR, title: 'H', runAtMs: T0 + HOUR, request: REQ, ownerPid: 4242, now: T0 });
+  assert.equal(updateTicketRequest(held.id, next), null, 'a waiting terminal holds it');
+  assert.deepEqual(getTicket(held.id, { withRequest: true }).request, REQ);
+});
+
+test('rewriteSeriesRequest: the series and its waiting tickets in place, one transaction; an ended series is refused', () => {
+  const { schedule, ticket } = createSchedule({ title: 'S', projectDir: DIR, request: REQ, rule: nightly, now: T0 });   // `nightly` carries the anchor createSchedule needs
+  const extra = runScheduleNow(schedule.id, { now: T0 });                      // a forced Run now ticket, not yet claimed
+  const pick = { nodes: { n_plan: { model: 'claude-opus-5-5', effort: '' } } };
+  const seriesReq = { ...REQ, overlay: pick };
+  // Default: every waiting ticket gets the series request verbatim.
+  const out = rewriteSeriesRequest(schedule.id, seriesReq, { expectUpdatedAt: getSchedule(schedule.id).updatedAt, now: T0 + 1000, by: 'ada' });
+  assert.deepEqual([...out.ticketIds].sort(), [ticket.id, extra.id].sort());
+  assert.deepEqual(getSchedule(schedule.id, { withRequest: true }).request, seriesReq);
+  assert.equal(getSchedule(schedule.id).updatedBy, 'ada');
+  assert.deepEqual(getTicket(ticket.id, { withRequest: true }).request, seriesReq, 'same id: the occurrence is updated, not replaced');
+  assert.deepEqual(getTicket(extra.id, { withRequest: true }).request, seriesReq);
+  assert.equal(listTickets({ scheduleId: schedule.id }).length, 2, 'nothing dropped, nothing materialized');
+  // ticketRequest: a ticket keeps its own fields (schedule-models.mjs keeps each ticket's own `internal`).
+  getDb().prepare('UPDATE scheduled_runs SET request = ? WHERE id = ?').run(JSON.stringify({ ...REQ, internal: { own: true } }), ticket.id);
+  const pick2 = { nodes: { n_impl: { model: 'claude-opus-5-5', effort: 'high' } } };
+  assert.ok(rewriteSeriesRequest(schedule.id, { ...REQ, overlay: pick2 }, { ticketRequest: (r) => ({ ...r, overlay: pick2 }) }));
+  assert.deepEqual(getTicket(ticket.id, { withRequest: true }).request, { ...REQ, internal: { own: true }, overlay: pick2 });
+  assert.equal(rewriteSeriesRequest(schedule.id, REQ, { expectUpdatedAt: 'stale' }), null);
+  assert.throws(() => rewriteSeriesRequest(schedule.id, REQ, { ticketRequest: () => { throw new Error('boom'); } }), /boom/);
+  assert.deepEqual(getSchedule(schedule.id, { withRequest: true }).request.overlay, pick2, 'a failing ticket rewrite rolls the series back');
+  getDb().prepare("UPDATE schedules SET status = 'ended' WHERE id = ?").run(schedule.id);
+  assert.equal(rewriteSeriesRequest(schedule.id, REQ), null);
+});
+
+test('the fire uses the request as it is at the claim: an edit after the tick read it is not lost (Models… race)', async () => {
+  const a = createTicket({ projectDir: DIR, title: 'A', runAtMs: T0 + HOUR, request: REQ, now: T0 });
+  const b = createTicket({ projectDir: DIR, title: 'B', runAtMs: T0 + HOUR + 1000, request: REQ, now: T0 });   // after A: dueTickets orders by run_at
+  const edited = { ...REQ, overlay: { nodes: { n_plan: { model: 'claude-opus-5-5', effort: 'high' } } } };
+  const seen = {};
+  let landed = null;
+  const out = await runDueTickets({ now: T0 + HOUR + 5_000, start: async (tk) => {
+    seen[tk.id] = tk.request;
+    // A's start runs while B is still `scheduled` (dueTickets already read it): the window the re-read closes.
+    // runDueTickets swallows a throw here into a failed ticket, so the outcome is asserted OUTSIDE.
+    if (tk.id === a.id) landed = updateTicketRequest(b.id, edited);
+    return { ok: true };
+  } });
+  assert.ok(landed, 'the edit landed on B while A was starting');
+  assert.deepEqual([...out.fired].sort(), [a.id, b.id].sort());
+  assert.deepEqual(seen[b.id].overlay, edited.overlay);
 });
