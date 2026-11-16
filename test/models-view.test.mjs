@@ -11,6 +11,8 @@ import {
   renderExportWizard, collectExportWizard, applyConnectionModeIn,
 } from '../ui/public/models-view.mjs';
 import { bridgedBadge, degradationLine } from '../ui/public/bridge-view.mjs';
+import { readIndexHtml } from '../src/core/read-index-html.mjs';
+import { readStyleCss } from '../src/core/read-style-css.mjs';
 
 const doc = new JSDOM('<!doctype html><body></body>').window.document;
 
@@ -349,7 +351,7 @@ test('list: Codex built-ins have their own group; a Codex custom model carries a
   assert.deepEqual([...sec.querySelectorAll('.mv-builtin.mv-codex')].map((r) => r.dataset.id), ['gpt-5.5']);
   assert.match(sec.querySelector('.mv-summary').textContent, /gpt-5\.5: all efforts/);
   const card = el.querySelector('.mv-card[data-id="gpt-5.5-tuned"]');
-  assert.equal(card.querySelector('.mv-engine').textContent, 'Codex');
+  assert.equal(card.querySelector('.mv-engine').textContent, 'OpenAI Codex');
   assert.match(card.querySelector('.mv-summary').textContent, /low · high/);
   assert.equal(el.querySelectorAll('.mv-builtin:not(.mv-codex)').length, 2);
 });
@@ -381,7 +383,7 @@ test('editor: the engine swaps the efforts and hides env for Codex; collect send
   assert.equal(edit.querySelector('.mv-env').closest('.mv-field').hidden, true);
 });
 
-test('editor: a new model picks its connection first; through a provider it is Claude Code\'s, and an OpenAI Responses endpoint runs on Codex too', () => {
+test('editor: a new model picks its connection first; through a provider it is Claude Code\'s, and an OpenAI Responses endpoint runs on OpenAI Codex too', () => {
   const providers = { openai: { configured: false, keySet: false, keyOptional: false } };
   const el = renderModelEditor(null, EFFORTS, { doc, codexEfforts: CODEX_EFFORTS, providers });
   const conn = el.querySelector('.mv-conn');
@@ -392,7 +394,7 @@ test('editor: a new model picks its connection first; through a provider it is C
   assert.deepEqual(shown.map((l) => l.querySelector('.mv-conn-mode-rb').value), ['direct', 'env', 'provider']);
   assert.equal(shown[0].querySelector('.mv-conn-mode-title').textContent, "A harness's own sign-in");
   assert.equal(signin.hidden, false, 'the sign-in asks which harness');
-  assert.match(conn.querySelector('.mv-conn-runs').textContent, /^Runs on Codex only/);
+  assert.match(conn.querySelector('.mv-conn-runs').textContent, /^Runs on OpenAI Codex only/);
   // Through a provider the entry is Claude Code's: the sign-in leaves, the efforts are Claude Code's list.
   conn.querySelector('.mv-conn-mode-rb[value="provider"]').checked = true;
   applyConnectionModeIn(el);
@@ -406,7 +408,7 @@ test('editor: a new model picks its connection first; through a provider it is C
   conn.querySelector('.mv-conn-model').value = 'gpt-5.5';
   applyConnectionModeIn(el);
   assert.equal(conn.querySelector('.mv-conn-api').value, 'openai-responses');
-  assert.equal(conn.querySelector('.mv-conn-runs').textContent, "Runs on Claude Code (through worca's bridge) and Codex (directly).");
+  assert.equal(conn.querySelector('.mv-conn-runs').textContent, "Runs on Claude Code (through worca's bridge) and OpenAI Codex (directly).");
   // The id follows the provider and the upstream model until typed: gpt-5.5 itself is Codex's own sign-in.
   assert.equal(el.querySelector('.mv-id').value, 'openai-gpt-5.5');
   const { body } = collectModelEditor(el);
@@ -436,7 +438,7 @@ test('editor (edit): a stored Codex endpoint model keeps codex\'s rules — its 
   assert.deepEqual([...conn.querySelectorAll('.mv-conn-api option')].map((o) => o.value), ['openai-responses'], 'codex no longer speaks chat completions');
   assert.equal(conn.querySelector('.mv-conn-caps').hidden, true, 'the bridge\'s capability pins do not apply');
   assert.match(conn.querySelector('.mv-conn-note').textContent, /Codex calls the endpoint’s Responses API itself/);
-  assert.equal(conn.querySelector('.mv-conn-runs').textContent, "Runs on Claude Code (through worca's bridge) and Codex (directly).");
+  assert.equal(conn.querySelector('.mv-conn-runs').textContent, "Runs on Claude Code (through worca's bridge) and OpenAI Codex (directly).");
   const { body } = collectModelEditor(edit);
   assert.deepEqual(body.env, {});
   assert.deepEqual(body.upstream, upstream);
@@ -584,9 +586,9 @@ test('list: a Cursor custom model carries a Cursor badge, and there is no Cursor
 
 test('phones: the Models header and the model cards wrap at 760px instead of running off a 375px screen', async () => {
   const { readFileSync } = await import('node:fs');
-  const html = readFileSync(new URL('../ui/public/index.html', import.meta.url), 'utf8');
+  const html = readIndexHtml();
   assert.match(html, /<div class="mv-head-actions">\s*<button type="button" id="model-share-btn"/, 'the header buttons sit in a styled group, not an inline-styled div');
-  const css = readFileSync(new URL('../ui/public/style.css', import.meta.url), 'utf8');
+  const css = readStyleCss();
   assert.match(css, /\n\.mv-head-actions\{display:flex;gap:8px;flex:0 0 auto;\}/);
   const phone = css.match(/@media \(max-width:760px\)\{\s*\[data-view="models"\] \.topbar\{[^}]*\}[^@]*/);
   assert.ok(phone, 'a phone block for the Models page');

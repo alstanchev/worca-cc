@@ -12,7 +12,7 @@ const sl = (id, over = {}) => ({
 const OUTLINE = { why: 'three independent behaviours', slices: [sl('a'), sl('b'), sl('c')] };
 const REF = { feature: 'f1', index: 2, total: 3, outline: OUTLINE };
 
-const req = (shape, opts = {}) => resolveShapeRequest({ shape }, { enabled: true, ...opts });
+const req = (shape, opts = {}) => resolveShapeRequest({ shape }, opts);
 
 test('resolveShapeRequest: slices accepts auto and off, refuses anything else', () => {
   assert.equal(req({ slices: 'auto' }).shape.slices, 'auto');
@@ -63,11 +63,6 @@ test('resolveShapeRequest: the shape key set is pinned', () => {
   assert.deepEqual(req({ perspectives: ['qa'] }).shape, { perspectives: ['product', 'qa'] });
   assert.deepEqual(Object.keys(req({}).shape), ['perspectives']);
   assert.deepEqual(Object.keys(req({ slices: 'off', size: 'large' }).shape), ['perspectives', 'slices', 'size']);
-});
-
-test('resolveShapeRequest: the gate is checked before any field', () => {
-  const r = resolveShapeRequest({ shape: { slice: REF } }, { enabled: false, internal: true });
-  assert.equal(r.error, 'shape is not available on this server');
 });
 
 test('validateOutlineAnswer: approve with no edits', () => {
@@ -149,4 +144,21 @@ test('initialShaping: a slice ref wins over a saved feature', () => {
 test('initialShaping: with neither, the four keys are exactly as before', () => {
   assert.deepEqual(initialShaping(null), { perspectives: [...DEFAULT_PERSPECTIVES], rounds: [], approved: null, savedTo: null });
   assert.deepEqual(Object.keys(initialShaping({ perspectives: ['qa'] }, {})), ['perspectives', 'rounds', 'approved', 'savedTo']);
+});
+
+test('validatePlanAnswer revise: compliance is kept when the run already holds it, refused with today\'s message otherwise', async () => {
+  const { validatePlanAnswer } = await import('../src/core/shape/run.mjs');
+  const { normalizePerspectives } = await import('../src/shared/shape/perspectives.mjs');
+  const raw = { decision: 'revise', feedback: 'keep it', perspectives: ['product', 'qa', 'compliance'] };
+  const kept = validatePlanAnswer(raw, { revisable: true, perspectives: ['product', 'architect', 'compliance'] });
+  assert.equal(kept.ok, true);
+  assert.deepEqual(kept.payload.perspectives, ['product', 'qa', 'compliance']);
+  const refused = validatePlanAnswer(raw, { revisable: true, perspectives: ['product', 'architect'] });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.errors[0].message, normalizePerspectives(['compliance']).error);
+});
+
+test('resolveShapeRequest: compliance only with the gate\'s option', () => {
+  assert.equal(req({ perspectives: ['qa', 'compliance'] }).ok, false);
+  assert.deepEqual(req({ perspectives: ['qa', 'compliance'] }, { compliance: true }).shape.perspectives, ['product', 'qa', 'compliance']);
 });

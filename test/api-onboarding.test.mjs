@@ -59,7 +59,7 @@ test('GET answers the nine derived steps, counts, the CLI probe and both flags; 
   ]);
 });
 
-test('POST writes ONLY the two flags (Show again keeps welcomeSeen) and refuses non-booleans/unknown keys with 400, writing nothing', async () => {
+test('POST writes ONLY the stored flags (Show again keeps welcomeSeen) and refuses non-booleans/unknown keys with 400, writing nothing', async () => {
   await checkRows([
     { name: 'POST writes ONLY the flags and echoes the full payload; Show again keeps welcomeSeen', run: async () => {
       let s = await (await post({ hidden: true })).json();
@@ -73,6 +73,16 @@ test('POST writes ONLY the two flags (Show again keeps welcomeSeen) and refuses 
       s = await (await get()).json();
       assert.deepEqual([s.hidden, s.welcomeSeen], [false, true], 'persisted');
     } },
+    { name: 'POST accepts workspaceGuideSeen (boolean only) and GET carries it', run: async () => {
+      let r = await post({ workspaceGuideSeen: 'yes' });
+      assert.equal(r.status, 400);
+      assert.match((await r.json()).error, /onboarding\.workspaceGuideSeen/);
+      r = await post({ workspaceGuideSeen: true });
+      assert.equal(r.status, 200);
+      assert.equal((await r.json()).workspaceGuideSeen, true);
+      assert.equal((await (await get()).json()).workspaceGuideSeen, true, 'persisted');
+      await post({ workspaceGuideSeen: false });
+    } },
     { name: 'POST refuses non-booleans and unknown keys with 400, writing nothing', run: async () => {
       for (const body of [{ hidden: 'yes' }, { steps: { project: true } }, { welcomeSeen: 1 }]) {
         const r = await post(body);
@@ -83,4 +93,44 @@ test('POST writes ONLY the two flags (Show again keeps welcomeSeen) and refuses 
       assert.deepEqual([s.hidden, s.welcomeSeen], [false, true], 'unchanged');
     } },
   ]);
+});
+
+test('DELETE of the LAST workspace clears workspaceGuideSeen; deleting one of two keeps it', async () => {
+  const { getDb } = await import('../src/core/db.mjs');
+  const now = new Date().toISOString();
+  const seed = (id) => getDb().prepare("INSERT INTO workspaces (id, name, description, created_at, updated_at) VALUES (?, ?, '', ?, ?)").run(id, id, now, now);
+  const del = (id) => fetch(`${base}/api/workspaces/${id}`, { method: 'DELETE' });
+  seed('wks-guide-0000000a');
+  seed('wks-guide-0000000b');
+  await post({ workspaceGuideSeen: true });
+  await checkRows([
+    { name: 'one of two deleted: still seen', run: async () => {
+      assert.equal((await del('wks-guide-0000000a')).status, 200);
+      assert.equal((await (await get()).json()).workspaceGuideSeen, true);
+    } },
+    { name: 'the last deleted: unseen again', run: async () => {
+      assert.equal((await del('wks-guide-0000000b')).status, 200);
+      assert.equal((await (await get()).json()).workspaceGuideSeen, false);
+    } },
+  ]);
+});
+
+test('Stillhet: GET carries the ask switch and the issues URL; POST stillhetAsked is a boolean, undoable, and touches nothing else', async () => {
+  const pkg = JSON.parse((await import('node:fs')).readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  let s = await (await get()).json();
+  assert.equal(s.stillhetAsk, false);
+  assert.equal(s.stillhetAsked, false);
+  assert.equal(s.bugsUrl, pkg.bugs.url);
+  const bad = await post({ stillhetAsked: 'yes' });
+  assert.equal(bad.status, 400);
+  s = await (await post({ stillhetAsked: true })).json();
+  assert.equal(s.stillhetAsked, true);
+  const { settingsFile } = await import('../src/core/settings.mjs');
+  const { readFileSync } = await import('node:fs');
+  assert.equal(JSON.parse(readFileSync(settingsFile(), 'utf8')).onboarding.stillhetAsked, true);
+  s = await (await post({ stillhetAsked: false })).json();
+  assert.equal(s.stillhetAsked, false);
+  assert.notEqual(JSON.parse(readFileSync(settingsFile(), 'utf8')).onboarding?.stillhetAsked, true);
+  process.env.WORCA_STILLHET_ASK = '1';
+  try { assert.equal((await (await get()).json()).stillhetAsk, true); } finally { delete process.env.WORCA_STILLHET_ASK; }
 });

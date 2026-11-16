@@ -3,13 +3,12 @@
 // sub-agent model on Codex, and keep a hidden pick through a save (Review Focus 4).
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { JSDOM } from 'jsdom';
 import { useDomRelease } from './helpers/jsdom-release.mjs';
+import { readIndexHtml } from '../src/core/read-index-html.mjs';
 
 const trackDom = useDomRelease(afterEach);
-const htmlPath = fileURLToPath(new URL('../ui/public/index.html', import.meta.url));
 const appPath = fileURLToPath(new URL('../ui/public/app.js', import.meta.url));
 const PROJECT = '/tmp/proj-engine';
 
@@ -58,7 +57,7 @@ function apiFetch({ config = {}, sink = [] } = {}) {
 }
 
 async function boot(fetchHandler) {
-  const dom = trackDom(new JSDOM(readFileSync(htmlPath, 'utf8'), { url: 'http://localhost:4319/' }));
+  const dom = trackDom(new JSDOM(readIndexHtml(), { url: 'http://localhost:4319/' }));
   const { window } = dom;
   window.Element.prototype.scrollIntoView = function () {};
   window.WebSocket = class {
@@ -140,7 +139,7 @@ test('a row healed for the run says which pick of the other engine it keeps (rev
   assert.equal(kept(), null, 'on its own engine the pick is simply shown');
   pick(doc, 'codex');
   await waitFor(() => kept());
-  assert.equal(kept().textContent, 'Your Claude pick Haiku 4.5 is kept for Claude runs. Choose a model here to replace it.');
+  assert.equal(kept().textContent, 'Your Claude Code pick Haiku 4.5 is kept for Claude Code runs. Choose a model here to replace it.');
 });
 
 test('"+ Add model…" in an agent row opens the Models page with the model editor', async () => {

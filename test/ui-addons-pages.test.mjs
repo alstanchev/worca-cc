@@ -9,11 +9,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { JSDOM } from 'jsdom';
 import { useDomRelease } from './helpers/jsdom-release.mjs';
 import { checkRows } from './helpers/rows.mjs';
+import { readIndexHtml } from '../src/core/read-index-html.mjs';
+import { SERVER_MJS, readServerSource } from '../src/core/read-server-source.mjs';
 
 // Release each booted window after its test (see test/helpers/jsdom-release.mjs).
 const trackDom = useDomRelease(afterEach);
 
-const html = readFileSync(fileURLToPath(new URL('../ui/public/index.html', import.meta.url)), 'utf8');
+const html = readIndexHtml();
 const appPath = fileURLToPath(new URL('../ui/public/app.js', import.meta.url));
 
 const GSETS = [
@@ -152,6 +154,70 @@ test('Providers is a page of its own: its loader, its title, its level banner, a
       assert.equal(doc.getElementById('level-banner-text').textContent, 'Providers is part of Expert mode, so it is not in your menu.');
       assert.equal(doc.getElementById('level-banner-pill').dataset.lv, 'expert');
     } },
+    { name: 'the Image generation row is wired: a refused Save in its own line, Test picture in the row, a service fills its preset', run: async () => {
+      const routes = {
+        '/api/providers/images': () => ({ ok: false, status: 400, json: async () => ({ error: 'Enter a price; 0 for a free server' }) }),
+        '/api/images/test': { ok: true, w: 256, h: 256, ms: 900, dataUrl: 'data:image/png;base64,AAAA' },
+      };
+      const { window, doc } = await boot({ routes });
+      await go(window, 'providers');
+      const row = () => doc.querySelector('#providers-list .mv-pv-row[data-provider="images"]');
+      row().querySelector('.mv-im-save').click();
+      await settle();
+      const line = row().querySelector('.mv-pv-msg');
+      assert.deepEqual([line.textContent, line.classList.contains('err')], ['Enter a price; 0 for a free server', true]);
+      assert.equal(doc.querySelector('#providers-list .card-alert'), null, 'the row\'s own line, not the card\'s alert');
+      row().querySelector('.mv-im-test').click();
+      await settle();
+      assert.deepEqual([line.textContent, line.getAttribute('role')], ['', null], 'the Test clears the refused Save, its alert role too');
+      assert.equal(row().querySelector('.mv-im-made').textContent, 'Made in 1 s · 256×256');
+      const service = row().querySelector('.mv-im-service');
+      service.value = 'xai';
+      service.dispatchEvent(new window.Event('change', { bubbles: true }));
+      assert.equal(row().querySelector('.mv-im-field[data-field="baseUrl"]').value, 'https://api.x.ai/v1');
+      // A Save that goes through repaints the card: the new row's own Save takes the "Saved" state.
+      routes['/api/providers/images'] = {};
+      row().querySelector('.mv-im-save').click();
+      await settle();
+      assert.equal(row().querySelector('.mv-im-save').dataset.fbState, 'done');
+    } },
+    { name: 'the Sound row is wired: Test sends the typed key and shows the voices, a refused Save is the card\'s alert, an accepted one is Saved', run: async () => {
+      // Prefix match, first key wins: the Test route before the PATCH route.
+      const routes = {
+        '/api/providers/sound/test': { ok: true, voices: 6 },
+        '/api/providers/sound': () => ({ ok: false, status: 400, json: async () => ({ error: 'unknown sound field "voice"' }) }),
+      };
+      const { window, doc, calls } = await boot({ routes });
+      const bodies = [];
+      const inner = window.fetch;
+      globalThis.fetch = window.fetch = (u, opts = {}) => { if (String(u).startsWith('/api/providers/sound')) bodies.push(`${opts.method || 'GET'} ${u} ${opts.body}`); return inner(u, opts); };
+      await go(window, 'providers');
+      const row = () => doc.querySelector('#providers-list .mv-pv-row[data-provider="sound"]');
+      row().querySelector('.mv-pv-key').value = 'sk_typed_0123';
+      row().querySelector('.mv-so-test').click();
+      await settle();
+      assert.ok(calls.includes('POST /api/providers/sound/test'));
+      assert.deepEqual(bodies, ['POST /api/providers/sound/test {"apiKey":"sk_typed_0123"}']);
+      const result = row().querySelector('.mv-so-result');
+      assert.deepEqual([result.hidden, result.textContent, result.classList.contains('err')], [false, 'Key works · 6 voices', false]);
+      // A failed Test: the reason in the same line, in red.
+      routes['/api/providers/sound/test'] = { ok: false, message: 'ElevenLabs rejected the key' };
+      row().querySelector('.mv-so-test').click();
+      await settle();
+      assert.deepEqual([result.hidden, result.textContent, result.classList.contains('err')], [false, 'ElevenLabs rejected the key', true]);
+      row().querySelector('.mv-so-save').click();
+      await settle();
+      const alert = doc.querySelector('#providers-list .card-alert');
+      assert.ok(alert && alert.closest('.mv-pv-card').contains(row()), 'the Sound row\'s own card');
+      assert.deepEqual([alert.querySelector('.ca-title').textContent, alert.querySelector('.ca-detail').textContent], ['Not saved', 'unknown sound field "voice"']);
+      assert.equal(row().querySelector('.mv-pv-msg').textContent, '', 'the card\'s alert, not the row\'s line');
+      assert.ok(bodies.includes('PATCH /api/providers/sound {"apiKey":"sk_typed_0123"}'));
+      // A Save that goes through repaints the card: the new row's own Save takes the "Saved" state.
+      routes['/api/providers/sound'] = {};
+      row().querySelector('.mv-so-save').click();
+      await settle();
+      assert.equal(row().querySelector('.mv-so-save').dataset.fbState, 'done');
+    } },
   ]);
 });
 
@@ -237,7 +303,7 @@ test('Models is a page of its own: the catalog, the Engines card from GET /api/s
     { name: 'signing out of Copilot on the Providers page repaints its card there', run: async () => {
       let connected = true;
       const res = (body) => ({ ok: true, status: 200, json: async () => body });
-      const pv = () => ({ copilot: { connected, termsCurrent: true, login: 'ada', accountType: 'individual', maxConcurrent: 4 } });
+      const pv = () => ({ copilot: { connected, login: 'ada', accountType: 'individual', maxConcurrent: 4 } });
       const { window, doc } = await boot({ routes: {
         '/api/providers/copilot/logout': () => { connected = false; return res(pv()); },
         '/api/providers': () => res(pv()),
@@ -289,7 +355,7 @@ test('Marketplace is a page of its own: its loader and background refresh, its t
       assert.equal(doc.getElementById('topnav-title').textContent, 'Marketplace');
       assert.equal(doc.querySelector('#settings-tabs button[data-tab="plugins"]'), null);
       assert.equal(doc.querySelector('[data-view="settings"] #plugins-list'), null);
-      assert.deepEqual([...doc.querySelectorAll('#settings-tabs button[data-tab]')].map((b) => b.dataset.tab), ['general', 'tags', 'presets', 'runs', 'experimental', 'ask', 'guardrails', 'memory']);
+      assert.deepEqual([...doc.querySelectorAll('#settings-tabs button[data-tab]')].map((b) => b.dataset.tab), ['general', 'tags', 'presets', 'runs', 'automations', 'experimental', 'ask', 'guardrails', 'memory']);
     } },
     { name: 'at Simple, #marketplace still opens under a banner naming Advanced', run: async () => {
       const { window, doc } = await boot({ level: 'simple' });
@@ -306,8 +372,8 @@ test('Marketplace is a page of its own: its loader and background refresh, its t
 // off them, so no click lands on an old address (and no branch waits for a tab that is gone).
 test('no in-app link, route call or tab check names an old address', () => {
   const pub = fileURLToPath(new URL('../ui/public/', import.meta.url));
-  const files = readdirSync(pub, { recursive: true }).map(String).filter((f) => /\.(m?js|html)$/.test(f));
-  assert.ok(files.includes('app.js') && files.includes('index.html'));
+  const files = readdirSync(pub, { recursive: true }).map(String).filter((f) => /\.(m?js|html)$/.test(f) && !/^stillhet[\\/]/.test(f));   // stillhet: the prototype's code has its own gates (docs/rail/gate.md)
+  assert.ok(files.includes('app.js'));
   assert.ok(files.some((f) => /^graph[\\/]/.test(f)) && files.some((f) => /^ask[\\/]/.test(f)), 'the sweep reads ui/public/graph and ui/public/ask too');
   const offenders = [];
   for (const f of files) {
@@ -329,13 +395,14 @@ test('no in-app link, route call or tab check names an old address', () => {
 function copyFiles() {
   const root = fileURLToPath(new URL('../', import.meta.url));
   const walk = (dir) => readdirSync(root + dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory()
-    ? (e.name === 'vendor' ? [] : walk(`${dir}/${e.name}`)) : [`${dir}/${e.name}`]));
+    ? (e.name === 'vendor' || e.name === 'stillhet' ? [] : walk(`${dir}/${e.name}`)) : [`${dir}/${e.name}`]));
   const docs = ['README.md', 'THIRD_PARTY_NOTICES.md', '.claude/skills/creating-worca-cc-plugins/SKILL.md',
     ...readdirSync(root + 'docs').filter((f) => f.endsWith('.md')).map((f) => `docs/${f}`),
     ...readdirSync(root + 'plugins').map((d) => `plugins/${d}/README.md`).filter((f) => { try { readFileSync(root + f); return true; } catch { return false; } })];
-  const files = [...walk('ui/public'), ...walk('src'), 'ui/server.mjs'].filter((f) => /\.(m?js|html|css)$/.test(f)).concat(docs);
+  const files = [...walk('ui/public'), ...walk('src'), SERVER_MJS].filter((f) => /\.(m?js|html|css)$/.test(f)).concat(docs);
   return { root, files, docs };
 }
+const readCopy = (root, f) => (f === SERVER_MJS ? readServerSource() : readFileSync(root + f, 'utf8'));
 
 // U7: the four pages are named as pages ("the Providers page", "Connectors › Skills"); no string, prompt,
 // comment or user doc still sends anyone to a Settings tab that is gone. (docs/superpowers, docs/plans and
@@ -345,7 +412,7 @@ test('no copy in the app, the server or the docs points at Settings › Plugins 
   assert.ok(files.length > 50 && docs.length > 10, 'the sweep reads the tree');
   const offenders = [];
   for (const f of files) {
-    const src = readFileSync(root + f, 'utf8');
+    const src = readCopy(root, f);
     for (const m of src.matchAll(/Settings\s*[›>→▸]\s*(Plugins|Sets|Models|Providers)\b/g)) offenders.push(`${f}: ${m[0]}`);
     // A path through the old Plugins place ("worca → Plugins → <plugin> → Settings"); "Plugins → Marketplace" names the rename.
     for (const m of src.matchAll(/\bPlugins\s*[›>→▸]\s*(?!Marketplace\b)\S+/g)) offenders.push(`${f}: ${m[0]}`);
@@ -359,7 +426,7 @@ test('no copy points at the Marketplace page\'s old Available list, plugin cards
   const { root, files } = copyFiles();
   const offenders = [];
   for (const f of files) {
-    const src = readFileSync(root + f, 'utf8');
+    const src = readCopy(root, f);
     for (const re of [/Marketplace\s*[›>→▸]\s*Available\b/g, /\bAvailable list\b/g, /\*\*Available\*\*/g, /\bMarketplace card\b/g,
       /Marketplace\s*[›>→▸]\s*(?!Installed\b|Browse\b|Marketplaces\b|Add marketplace\b)\S+\s*[›>→▸]\s*Settings\b/g,
       /Marketplace page:\s*(?!Installed\b)\S+\s*›\s*Settings\b/g]) {

@@ -9,7 +9,6 @@
 // does NOT sandbox HOME/WORCA_HOME.
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { JSDOM } from 'jsdom';
 
@@ -17,11 +16,11 @@ import { confirmDialog, cancelDialog, dialogText } from './helpers/confirm-modal
 import { useDomRelease } from './helpers/jsdom-release.mjs';
 import { fieldErrorText, cardAlertOf, edit, lastToast } from './helpers/feedback.mjs';
 import { checkRows } from './helpers/rows.mjs';
+import { readIndexHtml } from '../src/core/read-index-html.mjs';
 
 // Release each booted window after its test (see test/helpers/jsdom-release.mjs).
 const trackDom = useDomRelease(afterEach);
 
-const htmlPath = fileURLToPath(new URL('../ui/public/index.html', import.meta.url));
 const appPath = fileURLToPath(new URL('../ui/public/app.js', import.meta.url));
 
 const DAY = 86400000;
@@ -56,7 +55,7 @@ const resolveAsk = (body) => {
 // the refetch after a delete paints the empty state.
 // `get` overrides keys of the GET /api/settings body (and of the save response built from it).
 async function boot({ postResponse, history = { threads: 3, worktrees: 2, attachments: 5, inFlight: 0 }, deleteResponse, get = {} } = {}) {
-  const dom = trackDom(new JSDOM(readFileSync(htmlPath, 'utf8'), { url: 'http://localhost:4317/' }));
+  const dom = trackDom(new JSDOM(readIndexHtml(), { url: 'http://localhost:4317/' }));
   const { window } = dom;
   window.Element.prototype.scrollIntoView = function () {};
   window.WebSocket = class { constructor() { this.readyState = 1; } send() {} close() {} addEventListener() {} };
@@ -134,7 +133,7 @@ test('ui-settings-ask: Save posts exactly the two ask keys', async () => {
   $('#askLimitsSave').click();
   await settle(tick);
   assert.equal(posts.length, 1, 'exactly one POST');
-  assert.deepEqual(posts[0], { askMaxTurns: 55, askMaxBudgetUsd: 3.5, chat: { scriptTools: true, suggestions: true, summariseCommands: true } });
+  assert.deepEqual(posts[0], { askMaxTurns: 55, askMaxBudgetUsd: 3.5, chat: { scriptTools: true, suggestions: true, summariseCommands: true, promptCheck: false } });
   assert.equal($('#askLimitsSave').textContent, 'Saved');
   assert.ok($('#askLimitsSave').classList.contains('is-done'));
   assert.equal($('#askNoCap').checked, false, 'an amount turns the guard on');
@@ -150,7 +149,7 @@ test('clearing ask limits: No cap ticked posts null and disables the field, unti
       untickNoCap($);
       $('#askLimitsSave').click();
       await tick();
-      assert.deepEqual(posts[0], { askMaxTurns: 400, askMaxBudgetUsd: '', chat: { scriptTools: true, suggestions: true, summariseCommands: true } });
+      assert.deepEqual(posts[0], { askMaxTurns: 400, askMaxBudgetUsd: '', chat: { scriptTools: true, suggestions: true, summariseCommands: true, promptCheck: false } });
       assert.equal($('#askNoCap').checked, true, 'an empty amount is the default: no cap');
       assert.equal($('#askMaxBudgetUsd').disabled, true);
     } },
@@ -166,7 +165,7 @@ test('clearing ask limits: No cap ticked posts null and disables the field, unti
       edit(window, $('#askMaxTurns'), '55');
       $('#askLimitsSave').click();
       await tick();
-      assert.deepEqual(posts[0], { askMaxTurns: 55, askMaxBudgetUsd: null, chat: { scriptTools: true, suggestions: true, summariseCommands: true } });
+      assert.deepEqual(posts[0], { askMaxTurns: 55, askMaxBudgetUsd: null, chat: { scriptTools: true, suggestions: true, summariseCommands: true, promptCheck: false } });
     } },
     { name: 'ui-settings-ask: Use defaults posts empty strings (the clear-to-default wire value)', run: async () => {
       const { $, posts, tick, openSettings } = await boot();
@@ -320,7 +319,7 @@ test('ui-settings-ask: the script toggle paints from chat prefs and rides the ca
   edit(window, cb, false);
   $('#askLimitsSave').click();
   await tick();
-  assert.deepEqual(posts[0].chat, { scriptTools: false, suggestions: true, summariseCommands: true });
+  assert.deepEqual(posts[0].chat, { scriptTools: false, suggestions: true, summariseCommands: true, promptCheck: false });
 });
 
 test('ui-settings-ask: the suggestions toggle paints from chat prefs and rides the card\'s Save', async () => {
@@ -333,7 +332,7 @@ test('ui-settings-ask: the suggestions toggle paints from chat prefs and rides t
   edit(window, cb, false);
   $('#askLimitsSave').click();
   await tick();
-  assert.deepEqual(posts[0].chat, { scriptTools: true, suggestions: false, summariseCommands: true });
+  assert.deepEqual(posts[0].chat, { scriptTools: true, suggestions: false, summariseCommands: true, promptCheck: false });
 });
 
 test('the web section posts askWeb only when touched (trimmed, blank lines dropped)', async () => {
@@ -383,4 +382,34 @@ test('web off posts an explicit off; "Any site, without asking" paints and posts
       assert.equal(posts[0].askWeb.anyHost, false);
     } },
   ]);
+});
+
+test('ui-settings-ask: the prompt check toggle sits after the suggestions row, is off by default and rides the card\'s Save', async () => {
+  const { window, $, posts, tick, openSettings } = await boot();
+  await openSettings();
+  const host = $('#ask-prompt-check-host');
+  assert.ok(host, 'the host exists');
+  assert.equal(host.previousElementSibling, $('#ask-suggestions-host'), 'directly under the suggestions row');
+  assert.ok(host.matches('div.field.drow.drow-stack'));
+  const cb = $('#askPromptCheck');
+  assert.ok(cb, 'the toggle is mounted');
+  assert.equal(cb.checked, false, 'an absent pref is OFF');
+  assert.match(host.textContent, /Check how clear a task prompt is/);
+  assert.doesNotMatch(host.textContent, /Improve/);
+  edit(window, cb, true);
+  $('#askLimitsSave').click();
+  await tick();
+  assert.equal(posts[0].chat.promptCheck, true);
+  assert.equal(posts[0].chat.suggestions, true, 'the suggestions switch keeps its painted value');
+});
+
+test('ui-settings-ask: "Use defaults" leaves a saved prompt check on', async () => {
+  const { $, posts, tick, openSettings } = await boot({ get: { chat: { promptCheck: true } } });
+  await openSettings();
+  assert.equal($('#askPromptCheck').checked, true, 'a stored true paints on');
+  $('#askLimitsReset').click();
+  await settle(tick);
+  assert.equal(posts.length, 1);
+  assert.ok(!('chat' in posts[0]), 'Use defaults posts no chat key');
+  assert.equal($('#askPromptCheck').checked, true, 'the repainted switch stays checked');
 });

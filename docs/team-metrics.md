@@ -4,8 +4,17 @@ Team metrics is a **git-backed, team-wide record of finished runs**. Every teamm
 Worca has a project enabled writes one small JSON file per finished run to an orphan branch
 (`worca-metrics`) on the project's own `origin` remote. There is no separate metrics server:
 the branch itself is the shared store, fetched and pushed like any other git ref. A **Team
-metrics** page (top-level, alongside History and Statistics) reads that branch back and
+metrics** page (sidebar, Expert level, alongside Runs and Statistics) reads that branch back and
 aggregates spend, runs, duration, autonomy and review cycles per project or per workspace.
+
+For one project or workspace and a range (This month, Last month, Quarter, Year, All time or
+Custom), the Overview tab shows Spend, Runs, Cost per run, Duration, Autonomy and Review cycles
+tiles, each with its change against the previous period (plus **Saved** when runs carry
+human-hour estimates, see [Human hours and "Saved"](#human-hours-and-saved)); Spend per week
+(grouped by workflow or another dimension) and Runs per week by outcome; the By workflow, By
+ticket, By actor and By model mix tables; the runs table; and **Export CSV**.
+
+![Team metrics page for the nimbus-crm project on the Overview tab, range Last month and synced just now: Spend, Runs, Cost per run, Duration, Autonomy and Review cycles tiles with their change against the previous month, Spend per week grouped by workflow, Runs per week by outcome, and the By workflow and By ticket tables](screenshots/team-metrics.png)
 
 Nothing about a run's own branch or history changes — `worca-metrics` carries only
 `.worca-metrics/` and is never merged into anything.
@@ -90,7 +99,7 @@ workspace runs follow that switch).
 
 ## Cost
 
-While the `runTags` feature flag is on, the Overview tab opens with three chips: **Overview** (the
+The Overview tab opens with three chips: **Overview** (the
 page as before), **By person** (the By actor table on its own) and **Cost**. Cost is the same Cost and
 value report as Statistics › Cost (see [statistics.md](./statistics.md)): KPIs, a filter bar,
 Allocate by → then by, a stacked area chart, one expandable table, saved views and Download CSV, over
@@ -203,9 +212,9 @@ It degrades rather than fails:
   period), lead time is hidden, and items read "Done".
 - **gh answers only partly** (rate limit, a repository the viewer cannot read): the note quotes
   GitHub's error; those runs stay unknown and are asked again later.
-- **Not GitHub** (GitLab, Bitbucket, Azure DevOps): merge tracking covers GitHub and Azure DevOps
-  repositories (Azure: set `WORCA_ADO_TOKEN`, see [Azure DevOps](azure-devops.md)); GitLab and
-  Bitbucket items show without merge data.
+- **Not GitHub** (GitLab, Bitbucket, Azure DevOps): merge tracking covers GitHub, Azure DevOps and Bitbucket Cloud
+  repositories (Azure: set `WORCA_ADO_TOKEN`, see [Azure DevOps](azure-devops.md); Bitbucket: set `WORCA_BB_TOKEN`,
+  see [Bitbucket](bitbucket.md)); GitLab and Bitbucket Data Center items show without merge data.
 
 ## Chat
 

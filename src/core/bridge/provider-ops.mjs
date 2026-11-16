@@ -8,12 +8,14 @@
 
 import {
   providerConfig, allProviders, updateProvider, resolveProviderSecret, providerSecretSet,
-  copilotTermsAcknowledged, acknowledgeCopilotTerms, clearCopilotSignIn,
-  listGlobalModels, addGlobalModel, updateGlobalModel, updateSpeech,
+  clearCopilotSignIn,
+  listGlobalModels, addGlobalModel, updateGlobalModel, updateSpeech, updateImages, updateSound,
 } from '../settings.mjs';
 import { speechState } from '../speech.mjs';
+import { imagesState } from '../images.mjs';
+import { soundState } from '../sound.mjs';
 import { speechAssetStore } from '../speech-assets.mjs';
-import { modelEnvRef, maskModelEnvValue, COPILOT_TERMS_VERSION, UPSTREAM_PROVIDERS, isUpstreamBaseUrl, EFFORTS } from '../model-env.mjs';
+import { modelEnvRef, maskModelEnvValue, UPSTREAM_PROVIDERS, isUpstreamBaseUrl, EFFORTS } from '../model-env.mjs';
 import {
   startDeviceFlow, pollDeviceFlow, githubLogin, copilotToken, invalidateCopilotToken,
   listCopilotModels, copilotUsage, catalogEntryForCopilotModel, copilotApiFor,
@@ -75,14 +77,11 @@ function sweepSessions(now = Date.now()) {
 }
 
 /**
- * Begin a Copilot sign-in. Refuses until the terms are acknowledged (§8.2).
+ * Begin a Copilot sign-in (the device flow).
  * @returns {Promise<{deviceCode, userCode, verificationUri, interval, expiresIn}>}
  */
 export async function beginCopilotLogin({ fetch: f } = {}) {
   refuseWithBroker('sign in to GitHub Copilot');
-  if (!copilotTermsAcknowledged()) {
-    throw Object.assign(new Error('acknowledge the GitHub Copilot notice before signing in'), { code: 'TERMS' });
-  }
   sweepSessions();
   const flow = await startDeviceFlow({ fetch: f });
   sessions.set(flow.deviceCode, { startedAt: Date.now(), expiresAt: Date.now() + Math.min(flow.expiresIn * 1000, SESSION_TTL_MS), interval: flow.interval });
@@ -123,9 +122,6 @@ export async function copilotLogout() {
   await clearCopilotSignIn();
 }
 
-/** Record the terms acknowledgement (§8.2). */
-export async function acknowledgeTerms() { return acknowledgeCopilotTerms(); }
-
 // ── state payloads (never a secret) ──────────────────────────────────────────
 
 const secretSource = (v) => (!v ? null : modelEnvRef(v) ? 'env' : 'stored');
@@ -143,9 +139,6 @@ export async function providersState({ quota = false, fetch: f, person = resolve
     connected: !!token,
     login: c.login || null,
     accountType: c.accountType,
-    acknowledgedTerms: c.acknowledgedTerms || null,
-    termsCurrent: copilotTermsAcknowledged(),
-    termsVersion: COPILOT_TERMS_VERSION,
     maxConcurrent: c.maxConcurrent,
     tokenSource: secretSource(c.githubToken),
     tokenRef: modelEnvRef(c.githubToken) ? c.githubToken : null,
@@ -170,7 +163,7 @@ export async function providersState({ quota = false, fetch: f, person = resolve
   // With the credential broker on, keys and the Copilot sign-in are per person on its key page:
   // each provider's state is the viewer's own slot there, not worca's (empty) settings.
   const broker = brokerEnabled() ? await brokerProviders(all, person) : { enabled: false };
-  return { copilot, openai: keyed('openai'), anthropic: keyed('anthropic'), speech: { ...speechState(), cacheBytes: speechCacheBytes() }, broker };
+  return { copilot, openai: keyed('openai'), anthropic: keyed('anthropic'), speech: { ...speechState(), cacheBytes: speechCacheBytes() }, images: imagesState(), sound: soundState(), broker };
 }
 
 /**
@@ -234,6 +227,26 @@ export async function patchSpeech(patch = {}) {
   // Credential broker: worca stores no keys at all (same rule as patchProvider).
   if (brokerEnabled() && Object.values(p).some((s) => s && typeof s.apiKey === 'string' && s.apiKey.trim())) refuseWithBroker('store a speech key');
   return updateSpeech(p);
+}
+
+/** Patch the images block from the UI (Design pictures): masked key echoes are dropped ("keep"). */
+export async function patchImages(patch = {}) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return updateImages(patch);
+  const p = { ...patch };
+  if (typeof p.apiKey === 'string' && p.apiKey.startsWith('••')) delete p.apiKey;
+  // Credential broker: worca stores no keys at all (same rule as patchSpeech).
+  if (brokerEnabled() && typeof p.apiKey === 'string' && p.apiKey.trim()) refuseWithBroker('store an image service key');
+  return updateImages(p);
+}
+
+/** Patch the sound block from the UI (Design sound): masked key echoes are dropped ("keep"). */
+export async function patchSound(patch = {}) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return updateSound(patch);
+  const p = { ...patch };
+  if (typeof p.apiKey === 'string' && p.apiKey.startsWith('••')) delete p.apiKey;
+  // Credential broker: worca stores no keys at all (same rule as patchImages).
+  if (brokerEnabled() && typeof p.apiKey === 'string' && p.apiKey.trim()) refuseWithBroker('store a sound key');
+  return updateSound(p);
 }
 
 // ── Copilot models: list for import, import ─────────────────────────────────

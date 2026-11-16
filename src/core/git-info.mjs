@@ -6,6 +6,7 @@
 // never shell out to real git/gh/GitHub. Nothing here ever throws.
 
 import { spawn } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdtemp, writeFile, rm, readFile, copyFile, rename, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
@@ -16,11 +17,23 @@ import { redactSecrets } from './redact.mjs';
 import * as azurePr from './pr/azure.mjs';
 import { readAzureCredentials } from './azure-credentials.mjs';
 import { parseAzurePrUrl } from '../shared/azure-remote.mjs';
+import * as bitbucketPr from './pr/bitbucket.mjs';
+import { readBitbucketCredentials } from './bitbucket-credentials.mjs';
+import { parseBitbucketPrUrl } from '../shared/bitbucket-remote.mjs';
 import { gitAvailable, gitMissingResult } from './git-available.mjs';
+import { guardedGitEnv } from './git-guard.mjs';
+import { quotaBlocked, quotaTracking, noteQuotaExhausted, isRateLimitText, formatResetTime, _testing as quotaTesting } from './github-quota.mjs';
+import { prStatusKey, readPrStatus, writePrStatus, forgetPrStatus, entryFresh, singleFlight, derivePr, _testing as prStatusTesting } from './pr-status-cache.mjs';
 export { parseRemoteUrl, remoteRepoSlug, sameRepo } from './forge.mjs';
 
-/** Default runner: spawn `cmd args` in `cwd`, resolve { ok, stdout, stderr, code }. */
-function defaultRun(cmd, args, { cwd, timeout = 0, env = null } = {}) {
+/** Default runner: spawn `cmd args` in `cwd`, resolve { ok, stdout, stderr, code }.
+ *  git, and gh in a checkout (it runs `git status`, `git push` there), get git-guard's env: no
+ *  repository-local hook or config command runs (security G2). */
+async function defaultRun(cmd, args, { cwd, timeout = 0, env = null } = {}) {
+  if (cwd && (cmd === 'git' || cmd === 'gh')) {
+    try { env = await guardedGitEnv(cwd, { env: env || process.env }); }
+    catch (err) { return { ok: false, stdout: '', stderr: err.message, code: -1 }; }
+  }
   return new Promise((resolve) => {
     let child;
     try {
@@ -53,6 +66,51 @@ export const DIFF_TIMEOUT_MS = 120_000;
 const ghRunsGit = (args) => args[0] === 'pr' && (args[1] === 'create' || (!args.includes('--repo') && !/^https?:\/\//.test(String(args[2] ?? ''))));
 let _runner = defaultRun; const _run = (cmd, args, o) => ((cmd === 'git' || (cmd === 'gh' && ghRunsGit(args))) && !gitAvailable() ? Promise.resolve(gitMissingResult()) : _runner(cmd, args, o));
 let _ghCache = null;
+let _now = () => Date.now();
+
+const quotaSkipped = (until) => ({ ok: false, stdout: '', code: -1, quotaSkipped: true,
+  stderr: `API rate limit exceeded (Worca waits for the GitHub quota reset at ${formatResetTime(until)})` });
+
+/**
+ * The one gate for read-only gh calls (F-X-02): while `resource`'s quota ('graphql' | 'core') is used up it
+ * spawns nothing and answers like a rate-limited gh (so every classifier reads 'rate-limit'); a rate-limited
+ * answer records the window. Writes never pass through here.
+ */
+async function ghRead(resource, args, opts) {
+  const blocked = quotaBlocked(resource, { now: _now() });
+  if (blocked) return quotaSkipped(blocked.until);
+  const r = await _run('gh', args, opts);
+  if (!r.ok && isRateLimitText(r.stderr)) await noteGhRateLimit(resource, opts?.env);
+  return r;
+}
+
+/**
+ * Learn when `resource`'s quota resets: gh gives no reset for a GraphQL limit, so ask `GET rate_limit` once (it does
+ * not count against the quota). Remaining > 0 there means a secondary limit: one minute. Unreadable: 15 min. Only
+ * when no window is open yet, so it is one probe per window. Nothing while the quota store is suspended.
+ */
+async function noteGhRateLimit(resource, env = null) {
+  const now = _now();
+  if (!quotaTracking() || quotaBlocked(resource, { now })) return;
+  // Lookups that hit the limit together share one probe (one per resource in flight).
+  const running = _rateProbes.get(resource);
+  if (running) return running;
+  const probe = probeRateLimit(resource, env, now).finally(() => _rateProbes.delete(resource));
+  _rateProbes.set(resource, probe);
+  return probe;
+}
+const _rateProbes = new Map();
+
+async function probeRateLimit(resource, env, now) {
+  const p = await _run('gh', ['api', 'rate_limit'], env ? { env } : {});
+  let resetAt = null, source = null;
+  try {
+    const r = p.ok ? JSON.parse(p.stdout).resources?.[resource] : null;
+    if (r && r.remaining > 0) { resetAt = now + 60_000; source = 'secondary'; }
+    else if (r && Number.isFinite(r.reset)) { resetAt = r.reset * 1000; source = 'reset'; }
+  } catch { /* unreadable: the fallback window */ }
+  noteQuotaExhausted(resource, { resetAt, now, source });
+}
 
 /** Parse `git diff --shortstat` output into { added, removed }. */
 export function parseShortstat(out) {
@@ -61,12 +119,31 @@ export function parseShortstat(out) {
   return { added: ins ? Number(ins[1]) : 0, removed: del ? Number(del[1]) : 0 };
 }
 
-/** Added/removed line counts for source...feature (merge-base/3-dot). 0/0 on any failure. */
+/** Added/removed line counts for source...feature (merge-base/3-dot). 0/0 on any failure. Inside a withRefSnapshot
+ *  scope, two names resolved to commit ids fix the answer for good: remembered per (repository, ids). */
 export async function diffShortstat(projectDir, source, feature) {
   if (!projectDir || !source || !feature) return { added: 0, removed: 0 };
+  const snap = await refSnapshot(projectDir);
+  const a = snap && resolveName(snap, source), b = snap && resolveName(snap, feature);
+  const key = a && b ? `${projectDir}\0${a}...${b}` : null;
+  if (key && shortstatCache.has(key)) return { ...shortstatCache.get(key) };
   const r = await _run('git', ['diff', '--shortstat', `${source}...${feature}`], { cwd: projectDir });
   if (!r.ok) return { added: 0, removed: 0 };
-  return parseShortstat(r.stdout);
+  const out = parseShortstat(r.stdout);
+  if (key) { if (shortstatCache.size >= 2000) shortstatCache.clear(); shortstatCache.set(key, out); }
+  return { ...out };
+}
+const shortstatCache = new Map();
+const SHA = /^[0-9a-f]{40,64}$/i;
+/** The commit id git would read `name` as, from a snapshot (gitrevisions order: refs/<name>, tags, heads, remotes,
+ *  remotes/<name>/HEAD), or null when the snapshot cannot say (a short id, HEAD, a ref outside it, `^`/`~`). */
+function resolveName(snap, name) {
+  if (SHA.test(name)) return name.toLowerCase();
+  if (!/^[\w./-]+$/.test(name) || /(^|\/)HEAD$|\.\./.test(name)) return null;
+  for (const ref of [`refs/${name}`, `refs/tags/${name}`, `refs/heads/${name}`, `refs/remotes/${name}`, `refs/remotes/${name}/HEAD`]) {
+    if (snap.has(ref)) return ref.startsWith('refs/tags/') ? null : snap.get(ref);   // a tag's own id may be no commit
+  }
+  return null;
 }
 
 /**
@@ -91,14 +168,23 @@ export async function commitFilesSince(projectDir, fromSha, toRef, { max = 2000,
 }
 
 /** Commits on `feature` not on `source` (`git rev-list --count source..feature`), or null on any failure.
- *  `timeout` (ms, default none) bounds the call; a timeout is a failure. */
+ *  `timeout` (ms, default none) bounds the call; a timeout is a failure. Inside a withRefSnapshot scope, two names
+ *  resolved to commit ids fix the answer for good, as diffShortstat's do: remembered per (repository, ids). */
 export async function commitsAhead(projectDir, source, feature, { timeout = 0 } = {}) {
   if (!projectDir || !source || !feature) return null;
+  const snap = await refSnapshot(projectDir);
+  const a = snap && resolveName(snap, source), b = snap && resolveName(snap, feature);
+  if (a && b && a === b) return 0;
+  const key = a && b ? `${projectDir}\0${a}..${b}` : null;
+  if (key && aheadCache.has(key)) return aheadCache.get(key);
   const r = await _run('git', ['rev-list', '--count', `${source}..${feature}`], { cwd: projectDir, ...(timeout > 0 ? { timeout } : {}) });
   if (!r.ok) return null;
   const n = Number.parseInt(String(r.stdout || '').trim(), 10);
-  return Number.isInteger(n) && n >= 0 ? n : null;
+  if (!Number.isInteger(n) || n < 0) return null;
+  if (key) { if (aheadCache.size >= 2000) aheadCache.clear(); aheadCache.set(key, n); }
+  return n;
 }
+const aheadCache = new Map();
 
 /**
  * Parse `git diff --name-status -M` rows. `head` omitted -> diff base vs working tree.
@@ -293,8 +379,33 @@ export async function uncommittedPatch(dir, { base = 'HEAD', outFile } = {}) {
 }
 
 /** True iff `branch` exists locally in `projectDir`. False on a missing repo/branch. */
+// One `for-each-ref` per repository for the length of a withRefSnapshot scope (the history list builds every row of
+// a repository from it: no `rev-parse` / `for-each-ref` per row). Outside a scope every call asks git.
+const refScope = new AsyncLocalStorage();
+/** Run `fn` with local and remote-tracking tips read once per repository (read-only listings, one request long). */
+export function withRefSnapshot(fn) { return refScope.run(new Map(), fn); }
+/** `make()`'s promise, made once per `key` inside a withRefSnapshot scope; null outside one. */
+function refScopeOnce(key, make) {
+  const scope = refScope.getStore();
+  if (!scope) return null;
+  if (!scope.has(key)) scope.set(key, make());
+  return scope.get(key);
+}
+/** `for-each-ref --format='%(refname) %(objectname)'` output -> refname -> sha. */
+export const parseRefTips = (out) => new Map(String(out || '').split(/\r?\n/).map((l) => l.trim().split(' ')).filter((p) => p.length === 2));
+/** refname -> sha for refs/heads, refs/remotes and refs/tags of `projectDir`, or null (no scope, or git failed: ask per call). */
+/** Inside a withRefSnapshot scope: refSnapshot's promise (for in-base.mjs); null outside one. */
+export const scopedRefTips = (projectDir) => (refScope.getStore() ? refSnapshot(projectDir) : null);
+function refSnapshot(projectDir) {
+  if (!projectDir) return null;
+  return refScopeOnce(`git-info\0${projectDir}`, () => _run('git', ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads', 'refs/remotes', 'refs/tags'], { cwd: projectDir })
+    .then((r) => (r.ok ? parseRefTips(r.stdout) : null)));
+}
+
 export async function branchExists(projectDir, branch) {
   if (!projectDir || !branch) return false;
+  const snap = await refSnapshot(projectDir);
+  if (snap) return snap.has(`refs/heads/${branch}`);
   const r = await _run('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: projectDir });
   return r.ok && !!r.stdout.trim();
 }
@@ -405,7 +516,10 @@ async function ghCreatePr({ projectDir, base, head, title, body = '', repo = nul
     return { ok: true, url, existed: false };
   }
   if (/already exists/i.test(r.stderr || '')) {
-    const v = await _run('gh', ['pr', 'view', headRef, ...repoArgs, '--json', 'url', '-q', '.url'], { cwd: projectDir, env: (await githubEnv('read', { repo: ownerRepo(repo) })).env });
+    // The person's own pull request, found as them ("push as me" reads, opt-in). Every other read
+    // here (status, checks, chips, the watcher, ghApi) feeds shared views, caches or automations,
+    // so it stays on worca's own credential.
+    const v = await _run('gh', ['pr', 'view', headRef, ...repoArgs, '--json', 'url', '-q', '.url'], { cwd: projectDir, env: (await githubEnv('read', { readAsPerson: true, repo: ownerRepo(repo) })).env });
     if (v.ok && v.stdout.trim()) return { ok: true, url: v.stdout.trim(), existed: true };
     // gh's message ends with the existing PR's URL ("… already exists:\n<url>");
     // use it when the view selector cannot resolve (e.g. a PR opened from another fork).
@@ -547,7 +661,7 @@ async function ghPrMergeable({ projectDir, head, repo = null, headOwner = null, 
   const selector = prUrl || (head ? prHeadRef(head, headOwner) : '');
   if (!selector) return 'UNKNOWN';
   const repoArgs = !prUrl && repo ? ['--repo', repo] : [];
-  const r = await _run('gh', ['pr', 'view', selector, ...repoArgs, '--json', 'mergeable', '-q', '.mergeable'], { cwd: projectDir, env: (await githubEnv('read', { repo: prUrl ? ownerRepoOfPrUrl(prUrl) : ownerRepo(repo) })).env });
+  const r = await ghRead('graphql', ['pr', 'view', selector, ...repoArgs, '--json', 'mergeable', '-q', '.mergeable'], { cwd: projectDir, env: (await githubEnv('read', { repo: prUrl ? ownerRepoOfPrUrl(prUrl) : ownerRepo(repo) })).env });
   if (!r.ok) return 'UNKNOWN';
   return normalizeMergeable(r.stdout.trim());
 }
@@ -630,7 +744,7 @@ export async function ghPrChecks({ projectDir, prUrl }) {
   if (!repo || !(await ghUsable())) return null;
   try {
     const [r, base] = await Promise.all([
-      _run('gh', ['pr', 'view', prUrl, '--json', 'mergeable,mergeStateStatus,reviewDecision,isDraft,statusCheckRollup'],
+      ghRead('graphql', ['pr', 'view', prUrl, '--json', 'mergeable,mergeStateStatus,reviewDecision,isDraft,statusCheckRollup,latestReviews,headRefOid'],
         { cwd: projectDir, env: (await githubEnv('read', { repo })).env }),
       ghPrBaseFailing({ projectDir, prUrl }).catch(() => ({ base: null, failing: [] })),
     ]);
@@ -638,7 +752,10 @@ export async function ghPrChecks({ projectDir, prUrl }) {
     const v = JSON.parse(r.stdout);
     const checks = rollupChecks(v.statusCheckRollup, { baseFailing: base.failing });
     const mergeable = normalizeMergeable(v.mergeable);
-    return { checks, mergeable, base: base.base,
+    const reviews = (Array.isArray(v.latestReviews) ? v.latestReviews : [])
+      .filter((x) => x?.author?.login && x.state).map((x) => ({ by: String(x.author.login), state: String(x.state) }));
+    return { checks, mergeable, base: base.base, reviews, headSha: typeof v.headRefOid === 'string' ? v.headRefOid : null,
+      draft: v.isDraft === true, reviewDecision: v.reviewDecision || null,
       status: prMergeStatus({ checks, mergeable, mergeState: v.mergeStateStatus, reviewDecision: v.reviewDecision, draft: v.isDraft === true, base: base.base }) };
   } catch { return null; }
 }
@@ -678,41 +795,133 @@ const normalizePr = (pr) => ({
  */
 /** The OPEN PR's verdict by one extra `gh pr view` (merged PRs need none). Null on any failure: the chip keeps today's words. */
 async function ghPrVerdict(projectDir, url) {
-  const v = await _run('gh', ['pr', 'view', url, '--json', VERDICT_FIELDS], { cwd: projectDir, env: (await githubEnv('read', { repo: ownerRepoOfPrUrl(url) })).env });
+  const v = await ghRead('graphql', ['pr', 'view', url, '--json', VERDICT_FIELDS], { cwd: projectDir, env: (await githubEnv('read', { repo: ownerRepoOfPrUrl(url) })).env });
   if (!v.ok) return null;
   try { return prVerdictOf(JSON.parse(v.stdout || 'null')); } catch { return null; }
 }
-async function ghFindPrForBranch({ projectDir, head, prUrl = null, withVerdict = false, includeClosed = false }) {
-  const done = async (pr) => (withVerdict && pr && pr.state === 'OPEN' ? { ...pr, verdict: await ghPrVerdict(projectDir, pr.url) } : pr);
+/**
+ * The gh lookup as a stored entry (pr-status-cache.mjs): { ok:true, entry: { checkedAt, live, closed, verdict? } } |
+ * { ok:false, reason }. `live` is the OPEN or MERGED PR, `closed` the closed fallback (the closed PR behind the URL,
+ * else the branch's newest closed one). "No PR" needs every gh call the answer depends on to succeed: a failed or
+ * unparseable list, or a failed read of the recorded PR with no live PR in the list, is a failure. A failed verdict
+ * view is not (`verdict` is then null). `verdict` is present only when it was asked for (withVerdict, an OPEN PR).
+ */
+async function ghFindPrEntry({ projectDir, head, prUrl = null, withVerdict = false }) {
+  const done = async (live, closed = null) => ({ ok: true, entry: { checkedAt: _now(), live, closed,
+    ...(withVerdict && live?.state === 'OPEN' ? { verdict: await ghPrVerdict(projectDir, live.url) } : {}) } });
   let closedAtUrl = null;
+  let viewFailed = false;
   if (prUrl) {
-    const v = await _run('gh', ['pr', 'view', prUrl, '--json', PR_FIELDS], { cwd: projectDir, env: (await githubEnv('read', { repo: ownerRepoOfPrUrl(prUrl) })).env });
-    if (v.ok) {
-      let obj = null;
-      try { obj = JSON.parse(v.stdout || 'null'); } catch { obj = null; }
-      if (obj && typeof obj === 'object' && !Array.isArray(obj) && obj.url) {
-        const pr = normalizePr(obj);
-        if (pr.state === 'OPEN' || pr.state === 'MERGED') return done(pr);
-        // CLOSED: fall through to the branch search below; includeClosed's last resort.
-        if (pr.state === 'CLOSED') closedAtUrl = pr;
-      }
-    }
+    const v = await ghRead('graphql', ['pr', 'view', prUrl, '--json', PR_FIELDS], { cwd: projectDir, env: (await githubEnv('read', { repo: ownerRepoOfPrUrl(prUrl) })).env });
+    let obj = null;
+    if (v.ok) { try { obj = JSON.parse(v.stdout || 'null'); } catch { obj = null; } }
+    if (obj && typeof obj === 'object' && !Array.isArray(obj) && obj.url) {
+      const pr = normalizePr(obj);
+      if (pr.state === 'OPEN' || pr.state === 'MERGED') return done(pr);
+      // CLOSED: fall through to the branch search below; includeClosed's last resort.
+      if (pr.state === 'CLOSED') closedAtUrl = pr;
+    } else viewFailed = true;
   }
-  const r = await _run(
-    'gh',
+  const r = await ghRead(
+    'graphql',
     ['pr', 'list', '--head', head, '--state', 'all', '--json', PR_FIELDS, '--limit', '30'],
     { cwd: projectDir, env: (await githubEnv('read', { repo: null })).env },
   );
-  let norm = [];
-  try {
-    const arr = r.ok ? JSON.parse(r.stdout || '[]') : [];
-    if (Array.isArray(arr)) norm = arr.map(normalizePr);
-  } catch { /* unparseable output: no PR */ }
+  if (!r.ok) return { ok: false, reason: 'gh-failed' };
+  let arr;
+  try { arr = JSON.parse(r.stdout || '[]'); } catch { arr = null; }
+  if (!Array.isArray(arr)) return { ok: false, reason: 'gh-bad-output' };
+  const norm = arr.map(normalizePr);
   // Requirement is binary: hide the button if any OPEN or MERGED PR exists.
   const live = norm.find((p) => p.state === 'OPEN') || norm.find((p) => p.state === 'MERGED');
   if (live) return done(live);
-  if (!includeClosed) return null;
-  return closedAtUrl || norm.find((p) => p.state === 'CLOSED') || null;
+  // The recorded PR could not be read, and a cwd branch search cannot prove a cross-repo PR is gone —
+  // unless the list itself names the recorded PR, which then is its known state.
+  if (viewFailed) {
+    closedAtUrl = norm.find((p) => p.url === prUrl) || null;
+    if (!closedAtUrl) return { ok: false, reason: 'gh-failed' };
+  }
+  return done(null, closedAtUrl || norm.find((p) => p.state === 'CLOSED') || null);
+}
+
+/** A REST pull object as findPrForBranch's PR. REST has no `mergeable` in a list: UNKNOWN until the verdict view. */
+const restPr = (j) => ({
+  state: j?.merged_at ? 'MERGED' : String(j?.state || '').toUpperCase(),
+  url: String(j?.html_url || ''),
+  number: Number(j?.number) || null,
+  isDraft: j?.draft === true,
+  mergeable: 'UNKNOWN',
+});
+
+/**
+ * The github.com lookup over REST (core quota; D5): the recorded PR by `GET repos/o/r/pulls/n`, else the branch by
+ * `GET repos/{base}/pulls?head={headOwner}:{branch}&state=all&per_page=30`. Selection and failure rules are
+ * ghFindPrEntry's. An OPEN PR adds one GraphQL `gh pr view --json VERDICT_FIELDS` for `mergeable` and the verdict;
+ * when that is skipped or fails, `last` (the stored entry) gives them for the same URL, else UNKNOWN and null.
+ * → { ok:true, entry } | { ok:false, reason: 'quota'|'gh-failed'|'gh-bad-output' }.
+ */
+async function ghRestFindPr({ projectDir, head, prUrl = null, base, headOwner, last = null }) {
+  let quota = false;
+  const get = async (repo, path) => {
+    const r = await ghApi({ role: 'read', repo, path });
+    if (!r.ok && r.class === 'rate-limit') quota = true;
+    return r;
+  };
+  const fail = (reason) => ({ ok: false, reason: quota ? 'quota' : reason });
+  let live = null, closedAtUrl = null, viewFailed = false, closed = null;
+  const p = prUrl ? parseGithubPrUrl(prUrl) : null;
+  if (p) {
+    const v = await get(`${p.owner}/${p.repo}`, `repos/${p.owner}/${p.repo}/pulls/${p.number}`);
+    const j = v.ok && v.json && typeof v.json === 'object' && !Array.isArray(v.json) && v.json.html_url ? v.json : null;
+    if (j) {
+      const pr = restPr(j);
+      if (pr.state === 'OPEN' || pr.state === 'MERGED') live = pr;
+      else if (pr.state === 'CLOSED') closedAtUrl = pr;
+    } else viewFailed = true;
+  } else if (prUrl) viewFailed = true;
+  if (!live) {
+    const r = await get(base, `repos/${base}/pulls?head=${encodeURIComponent(headOwner)}:${encodeURIComponent(head)}&state=all&per_page=30`);
+    if (!r.ok) return fail('gh-failed');
+    if (!Array.isArray(r.json)) return fail('gh-bad-output');
+    const norm = r.json.map(restPr);
+    live = norm.find((x) => x.state === 'OPEN') || norm.find((x) => x.state === 'MERGED') || null;
+    if (!live && viewFailed) {
+      closedAtUrl = norm.find((x) => x.url === prUrl) || null;
+      if (!closedAtUrl) return fail('gh-failed');
+    }
+    if (!live) closed = closedAtUrl || norm.find((x) => x.state === 'CLOSED') || null;
+  }
+  let verdict = null;
+  if (live?.state === 'OPEN') {
+    const v = await ghRead('graphql', ['pr', 'view', live.url, '--json', VERDICT_FIELDS],
+      { cwd: projectDir, env: (await githubEnv('read', { repo: ownerRepoOfPrUrl(live.url) })).env });
+    let read = null;
+    if (v.ok) { try { read = prVerdictOf(JSON.parse(v.stdout || 'null')); } catch { read = null; } }
+    if (read) { verdict = read; live = { ...live, mergeable: read.mergeable }; }
+    else if (last?.live?.url === live.url) { verdict = last.verdict ?? null; live = { ...live, mergeable: last.live.mergeable || 'UNKNOWN' }; }
+  }
+  return { ok: true, entry: { checkedAt: _now(), live, closed, ...(live?.state === 'OPEN' ? { verdict } : {}) } };
+}
+
+/**
+ * Where a project's PRs live, from its remotes (no network): `slug` (the base remote's, for the shared key),
+ * and on github.com `base` ("owner/repo") plus `headOwner()` (resolves the owner of the remote the branch was pushed
+ * to, else origin's, else the base's). null when the remotes cannot be read.
+ */
+async function ghLookupTarget(projectDir, head) {
+  const rl = await listRemotes(projectDir);
+  if (!rl.ok || !rl.remotes.length) return null;
+  const named = (n) => rl.remotes.find((r) => r.name === n) || null;
+  const baseRemote = named('upstream') || named('origin') || rl.remotes[0];
+  const slug = baseRemote.slug || null;
+  const ghOwner = (r) => (r && r.host === 'github.com' && r.owner ? r.owner : null);
+  if (!ghOwner(baseRemote) || !baseRemote.repo) return { slug, base: null, headOwner: null };
+  // The head's owner costs a git spawn: only a REST lookup that really runs asks for it, never a cache hit.
+  const headOwner = async () => {
+    const pushed = await branchPushedTo(projectDir, head);
+    return ghOwner(pushed && named(pushed.remote)) || ghOwner(named('origin')) || baseRemote.owner;
+  };
+  return { slug, base: `${baseRemote.owner}/${baseRemote.repo}`, headOwner };
 }
 
 /** A PR's current body via its (repo-agnostic) URL. { ok, body } | { ok:false, error }. Never throws. */
@@ -864,7 +1073,7 @@ export async function prBaseBranch(projectDir, name, remoteNames = []) {
 
 /** OPEN | MERGED | CLOSED | null — unlike findPrForBranch, CLOSED is reported (keep policy `until-pr`). */
 async function ghPrLifecycleState({ projectDir, prUrl }) {
-  const v = await _run('gh', ['pr', 'view', prUrl, '--json', 'state'],
+  const v = await ghRead('graphql', ['pr', 'view', prUrl, '--json', 'state'],
     { cwd: projectDir, env: (await githubEnv('read', { repo: ownerRepoOfPrUrl(prUrl) })).env });
   if (!v.ok) return null;
   try { const s = JSON.parse(v.stdout || 'null')?.state; return ['OPEN', 'MERGED', 'CLOSED'].includes(s) ? s : null; } catch { return null; }
@@ -903,7 +1112,7 @@ export async function ghItemSummaries({ repo, numbers, timeout = GH_CHIP_TIMEOUT
   const cred = await githubEnv('read', { repo: `${owner}/${name}` });
   if (cred.error) return out;                      // a failed App mint: never fall back to the server user's own gh login
   // --hostname: these refs are github.com ones even when the server's GH_HOST names an Enterprise host.
-  const r = await _run('gh', ['api', 'graphql', '--hostname', 'github.com', '-f', `query=${query}`], { timeout, env: cred.env });
+  const r = await ghRead('graphql', ['api', 'graphql', '--hostname', 'github.com', '-f', `query=${query}`], { timeout, env: cred.env });
   let body = null;
   try { body = JSON.parse(r.stdout || 'null'); } catch { body = null; }
   // Every number misses one of its two aliases, so gh always exits non-zero here; it still prints the data it has.
@@ -914,22 +1123,30 @@ export async function ghItemSummaries({ repo, numbers, timeout = GH_CHIP_TIMEOUT
 }
 
 // ── PR providers (dispatch by forge) ────────────────────────────────────────
-// The GitHub provider is the gh code above (so _testing.setRunner keeps intercepting it);
-// Azure DevOps goes to pr/azure.mjs. Only Azure diverts — GHE and unknown hosts keep gh (D4).
+// The GitHub provider is the gh code above (so _testing.setRunner keeps intercepting it); Azure DevOps goes to
+// pr/azure.mjs and Bitbucket Cloud to pr/bitbucket.mjs, which export the same names. Only those two divert — GHE and
+// unknown hosts keep gh (D4).
+const REST = {
+  azure: { pr: azurePr, parse: parseAzurePrUrl, configured: () => readAzureCredentials().mode !== 'none' },
+  bitbucket: { pr: bitbucketPr, parse: parseBitbucketPrUrl, configured: () => readBitbucketCredentials().mode !== 'none' },
+};
+const restFor = (forge) => (typeof forge === 'string' && Object.hasOwn(REST, forge) ? REST[forge] : null);
+const restCredential = () => Object.values(REST).some((r) => r.configured());
 
 const PROVIDERS = {
   github: { forge: 'github', label: FORGE_LABEL.github,
     available: async () => ((await hasGh()) ? { ok: true } : { ok: false, reason: 'GitHub CLI (gh) is not available' }) },
   azure: { forge: 'azure', label: FORGE_LABEL.azure, available: () => azurePr.available() },
+  bitbucket: { forge: 'bitbucket', label: FORGE_LABEL.bitbucket, available: () => bitbucketPr.available() },
 };
-/** The PR provider for a base remote (a listRemotes entry). Only Azure diverts; every other host keeps gh (D4). */
-export const prProviderFor = (remote) => PROVIDERS[forgeOf(remote) === 'azure' ? 'azure' : 'github'];
+/** The PR provider for a base remote (a listRemotes entry). Azure DevOps and Bitbucket divert; every other host keeps gh (D4). */
+export const prProviderFor = (remote) => PROVIDERS[restFor(forgeOf(remote)) ? forgeOf(remote) : 'github'];
 
 /** Which PR hosts worca can talk to right now (no network). */
 export async function prHostsAvailable() {
-  return { github: await hasGh(), azure: readAzureCredentials().mode !== 'none' };
+  return { github: await hasGh(), azure: REST.azure.configured(), bitbucket: REST.bitbucket.configured() };
 }
-export async function anyPrHost() { const h = await prHostsAvailable(); return h.github || h.azure; }
+export async function anyPrHost() { const h = await prHostsAvailable(); return h.github || h.azure || h.bitbucket; }
 
 /** The remote a project's PRs target with no stored PR URL: upstream, else origin, else the first (gh's own guess). */
 async function prBaseRemote(projectDir) {
@@ -937,72 +1154,113 @@ async function prBaseRemote(projectDir) {
   if (!rl.ok || !rl.remotes.length) return null;
   return rl.remotes.find((r) => r.name === 'upstream') || rl.remotes.find((r) => r.name === 'origin') || rl.remotes[0];
 }
-/** The project's base remote when it is on Azure DevOps — only looked up when an Azure credential exists (D6). */
-async function azureBaseRemote(projectDir) {
-  if (!projectDir || readAzureCredentials().mode === 'none') return null;
+/** The project's base remote when it is on Azure DevOps or Bitbucket — only looked up when such a credential exists (D6). */
+async function restBaseRemote(projectDir) {
+  if (!projectDir || !restCredential()) return null;
   const r = await prBaseRemote(projectDir);
-  return forgeOf(r) === 'azure' ? r : null;
+  return restFor(forgeOf(r)) ? r : null;
 }
 
 /**
- * anyPrHost() lets an Azure-only machine (no gh) into these paths for every project. A GitHub/other project there
- * must not spawn a doomed `gh` per row: skip gh when it is missing. Checked only when an Azure credential is
- * configured, so gh-only setups (and the runner-scripted tests, whose setRunner resets the hasGh memo) see
- * exactly today's calls.
+ * anyPrHost() lets an Azure- or Bitbucket-only machine (no gh) into these paths for every project. A GitHub/other
+ * project there must not spawn a doomed `gh` per row: skip gh when it is missing. Checked only when such a credential
+ * is configured, so gh-only setups (and the runner-scripted tests, whose setRunner resets the hasGh memo) see exactly
+ * today's calls.
  */
 async function ghUsable() {
-  return readAzureCredentials().mode === 'none' || hasGh();
+  return !restCredential() || hasGh();
 }
 
 /**
  * Open a PR on the base remote's forge. `baseRemote` / `pushRemote` (listRemotes entries) pick the provider;
- * without an Azure base remote this is gh's createPr (see ghCreatePr). @returns {Promise<import('./pr/azure.mjs').PrCreateResult>}
+ * without an Azure or Bitbucket base remote this is gh's createPr (see ghCreatePr). @returns {Promise<import('./pr/azure.mjs').PrCreateResult>}
  */
 export async function createPr(opts) {
-  if (forgeOf(opts.baseRemote) === 'azure') {
-    return azurePr.createPr({ ...opts, baseRepo: opts.baseRemote, pushRepo: opts.pushRemote || null });
-  }
-  return ghCreatePr(opts);
+  const rest = restFor(forgeOf(opts.baseRemote));
+  if (rest) return rest.pr.createPr({ ...opts, baseRepo: opts.baseRemote, pushRepo: opts.pushRemote || null });
+  return forgetAfter(ghCreatePr(opts), { head: opts.head });
 }
 
 /** MERGEABLE | CONFLICTING | UNKNOWN, by the PR URL's forge, else the base remote's (see ghPrMergeable). */
 export async function prMergeable(opts = {}) {
-  if (forgeOfPrUrl(opts.prUrl) === 'azure') return (await azurePr.viewPr({ prUrl: opts.prUrl }))?.mergeable || 'UNKNOWN';
+  const byUrl = restFor(forgeOfPrUrl(opts.prUrl));
+  if (byUrl) return (await byUrl.pr.viewPr({ prUrl: opts.prUrl, withMergeable: true }))?.mergeable || 'UNKNOWN';
   if (!opts.prUrl) {
-    const az = forgeOf(opts.baseRemote) === 'azure' ? opts.baseRemote : await azureBaseRemote(opts.projectDir);
-    if (az) return (await azurePr.findPrForBranch({ head: opts.head, baseRepo: az }))?.mergeable || 'UNKNOWN';
+    const r = restFor(forgeOf(opts.baseRemote)) ? opts.baseRemote : await restBaseRemote(opts.projectDir);
+    if (r) return (await restFor(forgeOf(r)).pr.findPrForBranch({ head: opts.head, baseRepo: r, withMergeable: true }))?.mergeable || 'UNKNOWN';
   }
   if (!(await ghUsable())) return 'UNKNOWN';
   return ghPrMergeable(opts);
 }
 
 /**
- * { state: OPEN|MERGED, url, number, isDraft, mergeable } | null for `head`, by forge (see ghFindPrForBranch). Never throws.
- * `includeClosed` adds a CLOSED (Azure: abandoned) PR as the last resort.
+ * { state: OPEN|MERGED, url, number, isDraft, mergeable } | null for `head`, by forge (see ghFindPrEntry). Never throws.
+ * `includeClosed` adds a CLOSED (Azure: abandoned; Bitbucket: declined) PR as the last resort.
  * `withVerdict` (GitHub only): an OPEN PR also carries `verdict` (prVerdictOf), for the Runs list's PR chip (D31).
+ * A failed lookup reads as the last known PR (the shared store's), else null; lookupPrForBranch is the failure-aware variant.
  */
-export async function findPrForBranch({ projectDir, head, prUrl = null, withVerdict = false, includeClosed = false } = {}) {
-  if (!projectDir || !head) return null;
+export async function findPrForBranch(opts) {
+  const r = await lookupPrForBranch(opts);
+  return r.ok ? r.pr : (r.last ?? null);
+}
+
+/**
+ * findPrForBranch as a result that tells a failed lookup apart from "no PR" (F-3-01). Never throws:
+ * { ok:true, pr: Pr|null } | { ok:false, reason: 'quota'|'gh-failed'|'gh-bad-output'|'gh-unavailable', last?, retryAt? }
+ * (`reason` is diagnostic; `last` is the shared store's last answer for this caller, `retryAt` the quota reset in ms).
+ * Only the gh path reports failures; Azure and Bitbucket keep collapsing theirs to `{ ok:true, pr:null }` (not cached).
+ * The gh path answers from the store every Worca process on the machine shares (pr-status-cache.mjs) while it is
+ * fresh (`runEndedAt`, ms, ages a run with no PR), one lookup per key at a time; while the quota is used up it asks
+ * nothing. A failed lookup never writes the store.
+ */
+export async function lookupPrForBranch({ projectDir, head, prUrl = null, withVerdict = false, includeClosed = false, runEndedAt = null } = {}) {
+  if (!projectDir || !head) return { ok: true, pr: null };
   const strip = (pr) => (pr ? { state: pr.state, url: pr.url, number: pr.number, isDraft: pr.isDraft === true, mergeable: pr.mergeable || 'UNKNOWN' } : null);
-  if (forgeOfPrUrl(prUrl) === 'azure') {
-    const pr = await azurePr.viewPr({ prUrl });
-    if (pr && (pr.state === 'OPEN' || pr.state === 'MERGED')) return strip(pr);
+  const byUrl = restFor(forgeOfPrUrl(prUrl));
+  if (byUrl) {
+    const pr = await byUrl.pr.viewPr({ prUrl, withMergeable: true });
+    if (pr && (pr.state === 'OPEN' || pr.state === 'MERGED')) return { ok: true, pr: strip(pr) };
     // CLOSED: search the branch; the closed PR behind the URL stays the last resort.
-    const found = await azurePr.findPrForBranch({ head, baseRepo: parseAzurePrUrl(prUrl), includeClosed });
-    if (found && found.state !== 'CLOSED') return strip(found);
-    if (!includeClosed) return null;
-    return strip(pr?.state === 'CLOSED' ? pr : found);
+    const found = await byUrl.pr.findPrForBranch({ head, baseRepo: byUrl.parse(prUrl), includeClosed });
+    if (found && found.state !== 'CLOSED') return { ok: true, pr: strip(found) };
+    if (!includeClosed) return { ok: true, pr: null };
+    return { ok: true, pr: strip(pr?.state === 'CLOSED' ? pr : found) };
   }
-  const az = prUrl ? null : await azureBaseRemote(projectDir);
-  if (az) return strip(await azurePr.findPrForBranch({ head, baseRepo: az, includeClosed }));
-  if (!(await ghUsable())) return null;
-  return ghFindPrForBranch({ projectDir, head, prUrl, withVerdict, includeClosed });
+  const r = prUrl ? null : await restBaseRemote(projectDir);
+  if (r) return { ok: true, pr: strip(await restFor(forgeOf(r)).pr.findPrForBranch({ head, baseRepo: r, includeClosed, withMergeable: true })) };
+  if (!(await ghUsable())) return { ok: false, reason: 'gh-unavailable' };
+  let where = null;
+  try { where = await ghLookupTarget(projectDir, head); } catch { where = null; }
+  const rest = !!where?.base;
+  const resource = rest ? 'core' : 'graphql';
+  const key = prStatusKey({ repo: ownerRepoOfPrUrl(prUrl) || where?.slug, head, prUrl });
+  // A stored OPEN answer read without its verdict cannot serve a caller that wants one.
+  const usable = (e) => !!e && entryFresh(e, { now: _now(), runEndedAt }) && !(withVerdict && e.live?.state === 'OPEN' && !('verdict' in e));
+  const first = readPrStatus(key);
+  if (usable(first)) return { ok: true, pr: derivePr(first, { includeClosed, withVerdict }) };
+  const res = await singleFlight(key && `${key}\0${withVerdict ? 'v' : ''}`, async () => {
+    const stored = readPrStatus(key);          // another process may have answered meanwhile
+    if (usable(stored)) return { ok: true, entry: stored };
+    const blocked = quotaBlocked(resource, { now: _now() });
+    if (blocked) return { ok: false, reason: 'quota', stored, retryAt: blocked.until };
+    const startedAt = Date.now();              // a PR write by Worca after this makes the answer stale (forgetPrStatus)
+    const got = rest
+      ? await ghRestFindPr({ projectDir, head, prUrl, base: where.base, headOwner: await where.headOwner(), last: stored })
+      : await ghFindPrEntry({ projectDir, head, prUrl, withVerdict });
+    if (got.ok) { await writePrStatus(key, got.entry, { startedAt }); return got; }
+    const after = quotaBlocked(resource, { now: _now() });
+    return { ok: false, reason: after ? 'quota' : got.reason, stored, ...(after ? { retryAt: after.until } : {}) };
+  });
+  if (res.ok) return { ok: true, pr: derivePr(res.entry, { includeClosed, withVerdict }) };
+  const last = res.stored ? derivePr(res.stored, { includeClosed, withVerdict }) : null;
+  return { ok: false, reason: res.reason, ...(last ? { last } : {}), ...(res.retryAt ? { retryAt: res.retryAt } : {}) };
 }
 
 /** OPEN | MERGED | CLOSED | null for a persisted PR URL, by its forge (see ghPrLifecycleState). */
 export async function prLifecycleState({ projectDir, prUrl }) {
   if (!projectDir || !prUrl) return null;
-  if (forgeOfPrUrl(prUrl) === 'azure') return (await azurePr.viewPr({ prUrl }))?.state || null;
+  const byUrl = restFor(forgeOfPrUrl(prUrl));
+  if (byUrl) return (await byUrl.pr.viewPr({ prUrl }))?.state || null;
   if (!(await ghUsable())) return null;
   return ghPrLifecycleState({ projectDir, prUrl });
 }
@@ -1048,6 +1306,8 @@ export async function branchPushedTo(projectDir, branch) {
 export async function branchTips(projectDir, branch, remote) {
   if (!projectDir || !branch) return null;
   const refs = [`refs/heads/${branch}`, ...(remote ? [`refs/remotes/${remote}/${branch}`] : [])];
+  const snap = await refSnapshot(projectDir);
+  if (snap) return { local: snap.get(refs[0]) || null, remote: remote ? snap.get(refs[1]) || null : null };
   const r = await _run('git', ['for-each-ref', '--format=%(refname) %(objectname)', ...refs], { cwd: projectDir });
   if (!r.ok) return null;
   // for-each-ref also matches refs UNDER a pattern (refs/heads/feat/sub), so keep exact names only.
@@ -1064,13 +1324,20 @@ export async function branchTips(projectDir, branch, remote) {
 export async function tipsRelation(projectDir, local, remote) {
   if (!projectDir || !local || !remote) return null;
   if (local === remote) return 'same';
+  // Two commit ids fix the answer for good: remembered, so a history reload asks git once per pair.
+  const sha = /^[0-9a-f]{40,64}$/i;
+  const key = sha.test(local) && sha.test(remote) ? `${remote}...${local}` : null;
+  if (key && relationCache.has(key)) return relationCache.get(key);
   const r = await _run('git', ['rev-list', '--left-right', '--count', `${remote}...${local}`], { cwd: projectDir });
   const m = r.ok && /^(\d+)\s+(\d+)\s*$/.exec(r.stdout || '');
   if (!m) return null;
   const behind = Number(m[1]) > 0;
   const ahead = Number(m[2]) > 0;
-  return ahead && behind ? 'diverged' : ahead ? 'ahead' : behind ? 'behind' : 'same';
+  const rel = ahead && behind ? 'diverged' : ahead ? 'ahead' : behind ? 'behind' : 'same';
+  if (key) { if (relationCache.size >= 2000) relationCache.clear(); relationCache.set(key, rel); }
+  return rel;
 }
+const relationCache = new Map();
 
 /** Recreate a local branch from its remote-tracking ref (checkout D7). */
 export async function restoreBranchFromRemote(projectDir, branch, remote) {
@@ -1081,7 +1348,7 @@ export async function restoreBranchFromRemote(projectDir, branch, remote) {
 // stderr only: stdout can carry a GraphQL payload whose fields ("author") read like an auth failure.
 const ghWatchFailure = (r) => {
   const text = String(r?.stderr || '').toLowerCase();
-  if (/rate.?limit|secondary rate|abuse detection/.test(text)) return 'rate-limit';
+  if (isRateLimitText(text)) return 'rate-limit';
   if (/\bauth(?:entication|orization)?\b|credential|login|\b40[13]\b|resource not accessible/.test(text)) return 'auth';
   return 'failed';
 };
@@ -1101,7 +1368,7 @@ async function watchGraphql(query, vars, { projectDir, repo, role = 'read' }) {
     else if (Number.isSafeInteger(v)) args.push('-F', `${k}=${v}`);
     else return { ok: false, class: 'failed', error: `GraphQL variable ${k} has an unsupported type` };
   }
-  const r = await _run('gh', args, { cwd: projectDir, env: cred.env });
+  const r = role === 'read' ? await ghRead('graphql', args, { cwd: projectDir, env: cred.env }) : await _run('gh', args, { cwd: projectDir, env: cred.env });
   if (!r.ok) return { ok: false, class: ghWatchFailure(r), error: (r.stderr || '').trim() || `gh exited ${r.code}` };
   let body; try { body = JSON.parse(r.stdout); } catch { return { ok: false, class: 'failed', error: 'GitHub returned invalid JSON' }; }
   if (!body || (Array.isArray(body.errors) && body.errors.length)) return { ok: false, class: 'failed', error: 'GitHub GraphQL returned errors' };
@@ -1204,7 +1471,7 @@ export async function ghFailedJobLog({ projectDir, prUrl, databaseId } = {}) {
   const p = parseGithubPrUrl(prUrl); if (!p || !databaseId) return { ok: false, class: 'failed', error: 'invalid job log request' };
   const repo = `${p.owner}/${p.repo}`; const cred = await githubEnv('read', { repo });
   if (cred.error) return { ok: false, class: 'auth', error: cred.error };
-  const r = await _run('gh', ['run', 'view', '--job', String(databaseId), '--log-failed', '--repo', repo], { cwd: projectDir, env: cred.env });
+  const r = await ghRead('core', ['run', 'view', '--job', String(databaseId), '--log-failed', '--repo', repo], { cwd: projectDir, env: cred.env });
   if (!r.ok) return { ok: false, class: ghWatchFailure(r), error: (r.stderr || '').trim() || `gh exited ${r.code}` };
   // `--log-failed` prefixes every line with "<job>\t<step>\t<timestamp> ": keep only the message.
   const text = redactSecrets(String(r.stdout || '').replace(/^[^\t\n]*\t[^\t\n]*\t\uFEFF?(?:\d{4}-\d\d-\d\dT[\d:.]+Z ?)?/gm, ''));
@@ -1252,25 +1519,31 @@ export async function ghPrComment({ projectDir, prUrl, body } = {}) {
   const r = await _run('gh', ['pr', 'comment', String(p.number), '--repo', repo, '--body', String(body || '')], { cwd: projectDir, env: cred.env });
   return r.ok ? { ok: true } : { ok: false, class: ghWatchFailure(r), error: (r.stderr || '').trim() || `gh exited ${r.code}` };
 }
-// The Watch PR adapter by the PR URL's forge: Azure DevOps goes to pr/azure.mjs, github.com to gh above.
-const azureWatch = (prUrl) => forgeOfPrUrl(prUrl) === 'azure';
+// The Watch PR adapter by the PR URL's forge: Azure DevOps and Bitbucket go to their REST modules, github.com to gh above.
+const restWatch = (prUrl) => restFor(forgeOfPrUrl(prUrl))?.pr || null;
 export function prWatchSnapshot(opts = {}) {
-  return azureWatch(opts.prUrl) ? azurePr.prWatchSnapshot(opts) : ghPrWatchSnapshot(opts);
+  const rest = restWatch(opts.prUrl);
+  return rest ? rest.prWatchSnapshot(opts) : ghPrWatchSnapshot(opts);
 }
 export async function prWatchJobLog(opts = {}) {
-  if (!azureWatch(opts.prUrl)) return ghFailedJobLog(opts);
-  const r = await azurePr.failedBuildLog(opts);
+  const rest = restWatch(opts.prUrl);
+  if (!rest) return ghFailedJobLog(opts);
+  const r = await rest.failedBuildLog(opts);
   return r.ok ? { ok: true, text: tailBytes(redactSecrets(r.text), PR_WATCH_LOG_BYTES) } : r;
 }
-/** One more try of a failed check: a workflow run's failed jobs on GitHub, a build policy's re-queue on Azure DevOps. */
+/** One more try of a failed check: a workflow run's failed jobs on GitHub, a build policy's re-queue on Azure DevOps
+ *  (Bitbucket checks carry no runId, so the watcher never asks). */
 export function prWatchRerun(opts = {}) {
-  return azureWatch(opts.prUrl) ? azurePr.requeueEvaluation(opts) : ghRerunFailedJobs(opts);
+  const rest = restWatch(opts.prUrl);
+  return rest ? rest.requeueEvaluation(opts) : ghRerunFailedJobs(opts);
 }
 export function prWatchReply(opts = {}) {
-  return azureWatch(opts.prUrl) ? azurePr.replyToThread(opts) : ghReplyToThread(opts);
+  const rest = restWatch(opts.prUrl);
+  return rest ? rest.replyToThread(opts) : ghReplyToThread(opts);
 }
 export function prWatchComment(opts = {}) {
-  return azureWatch(opts.prUrl) ? azurePr.prComment(opts) : ghPrComment(opts);
+  const rest = restWatch(opts.prUrl);
+  return rest ? rest.prComment(opts) : ghPrComment(opts);
 }
 async function ghMarkPrReady({ projectDir = null, prUrl } = {}) {
   const cred = await githubEnv('write', { repo: ownerRepoOfPrUrl(prUrl) });
@@ -1285,23 +1558,67 @@ async function ghClosePr({ projectDir = null, prUrl, comment = '' } = {}) {
   const r = await _run('gh', ['pr', 'close', prUrl, ...(comment ? ['--comment', String(comment)] : [])], { cwd: projectDir || undefined, env: cred.env });
   return r.ok ? { ok: true } : { ok: false, error: (r.stderr || '').trim() || `gh exited ${r.code}` };
 }
+/** A successful gh write leaves the shared PR-status store's answer wrong: drop it before the caller reads again (C1). */
+async function forgetAfter(write, what) {
+  const r = await write;
+  if (r?.ok) await forgetPrStatus(what);
+  return r;
+}
 /** D24: mark a draft PR ready for review, by the URL's forge. */
 export function markPrReady(opts = {}) {
   if (!opts.prUrl) return Promise.resolve({ ok: false, error: 'prUrl is required' });
-  return azureWatch(opts.prUrl) ? azurePr.markReady(opts) : ghMarkPrReady(opts);
+  return restWatch(opts.prUrl) ? restWatch(opts.prUrl).markReady(opts) : forgetAfter(ghMarkPrReady(opts), { url: opts.prUrl });
 }
-/** D24: close a PR with a comment, by the URL's forge (Azure: abandoned). */
+/** D24: close a PR with a comment, by the URL's forge (Azure: abandoned; Bitbucket: declined). */
 export function closePr(opts = {}) {
   if (!opts.prUrl) return Promise.resolve({ ok: false, error: 'prUrl is required' });
-  return azureWatch(opts.prUrl) ? azurePr.closePr(opts) : ghClosePr(opts);
+  return restWatch(opts.prUrl) ? restWatch(opts.prUrl).closePr(opts) : forgetAfter(ghClosePr(opts), { url: opts.prUrl });
 }
+const GH_MERGE_METHODS = [['squashMergeAllowed', 'squash'], ['mergeCommitAllowed', 'merge'], ['rebaseMergeAllowed', 'rebase']];
+async function ghMergePr({ projectDir = null, prUrl, headSha = null } = {}) {
+  const repo = ownerRepoOfPrUrl(prUrl); if (!repo) return { ok: false, class: 'failed', error: 'invalid GitHub pull request URL' };
+  const cred = await githubEnv('write', { repo });
+  if (cred.error) return { ok: false, class: 'auth', error: cred.error };
+  const v = await _run('gh', ['repo', 'view', repo, '--json', GH_MERGE_METHODS.map(([k]) => k).join(',')], { cwd: projectDir || undefined, env: cred.env });
+  if (!v.ok) return { ok: false, class: ghWatchFailure(v), error: (v.stderr || '').trim() || `gh exited ${v.code}` };
+  let allowed = {}; try { allowed = JSON.parse(v.stdout) || {}; } catch { /* unreadable: gh's default below */ }
+  const method = GH_MERGE_METHODS.find(([k]) => allowed[k] === true)?.[1] || 'squash';
+  // The head whose checks the caller read: gh refuses the merge when the branch moved since (no unchecked commit lands).
+  const r = await _run('gh', ['pr', 'merge', prUrl, `--${method}`, ...(headSha ? ['--match-head-commit', String(headSha)] : [])],
+    { cwd: projectDir || undefined, env: cred.env });
+  if (!r.ok && headSha && /head branch was modified|match-head-commit|expected head/i.test(r.stderr || '')) {
+    return { ok: false, class: 'head-moved', error: (r.stderr || '').trim(), method };
+  }
+  return r.ok ? { ok: true, method } : { ok: false, class: ghWatchFailure(r), error: (r.stderr || '').trim() || `gh exited ${r.code}`, method };
+}
+async function ghRetargetPr({ projectDir = null, prUrl, base } = {}) {
+  const cred = await githubEnv('write', { repo: ownerRepoOfPrUrl(prUrl) });
+  if (cred.error) return { ok: false, error: cred.error };
+  const r = await _run('gh', ['pr', 'edit', prUrl, '--base', String(base)], { cwd: projectDir || undefined, env: cred.env });
+  return r.ok ? { ok: true } : { ok: false, error: (r.stderr || '').trim() || `gh exited ${r.code}` };
+}
+/** Merge PR (Stillhet Tasks): merge an open PR by its forge, with the repository's first allowed method of squash, merge,
+ *  rebase on GitHub (the forge's own default elsewhere). `headSha` pins the head the caller checked: a moved head is
+ *  refused with class 'head-moved'. → { ok, method } | { ok: false, class: 'rate-limit'|'auth'|'head-moved'|'failed', error }. */
+export function prMerge(opts = {}) {
+  if (!opts.prUrl) return Promise.resolve({ ok: false, class: 'failed', error: 'prUrl is required' });
+  return restWatch(opts.prUrl) ? restWatch(opts.prUrl).mergePr(opts) : forgetAfter(ghMergePr(opts), { url: opts.prUrl });
+}
+/** Point an open PR at another base branch (a stacked successor after its predecessor merged). → { ok } | { ok: false, error }. */
+export function prRetarget(opts = {}) {
+  if (!opts.prUrl || !opts.base) return Promise.resolve({ ok: false, error: 'prUrl and base are required' });
+  return restWatch(opts.prUrl) ? restWatch(opts.prUrl).retargetPr(opts) : ghRetargetPr(opts);
+}
+
 /** The PR card's checks rollup, mergeability and merge verdict, by forge (see ghPrChecks). null on any failure. */
 export async function prChecks({ projectDir, prUrl } = {}) {
-  if (!azureWatch(prUrl)) return ghPrChecks({ projectDir, prUrl });
-  const f = await azurePr.prCheckFacts({ prUrl });
+  const rest = restWatch(prUrl);
+  if (!rest) return ghPrChecks({ projectDir, prUrl });
+  const f = await rest.prCheckFacts({ prUrl });
   if (!f) return null;
   const checks = rollupChecks(f.items, { baseFailing: f.baseFailing });
-  return { checks, mergeable: f.mergeable, base: f.base,
+  return { checks, mergeable: f.mergeable, base: f.base, reviews: Array.isArray(f.reviews) ? f.reviews : [], headSha: f.headSha || null,
+    draft: f.draft === true, reviewDecision: f.reviewDecision || null,
     status: prMergeStatus({ checks, mergeable: f.mergeable, mergeState: f.mergeState, reviewDecision: f.reviewDecision, draft: f.draft, base: f.base }) };
 }
 
@@ -1342,8 +1659,83 @@ export async function checkConflictMerge(projectDir, { baseSha, from, to } = {})
 }
 
 // Test seam: swap the command runner + clear the gh memo. Mirrors server.mjs#_testing.
+// ── Git event automations (#711): one REST call on github.com ───────────────
+
+/** Split `gh api --include` output into { status, headers, text }. gh prints the status line and headers first. */
+export function parseGhInclude(out) {
+  const s = String(out || '');
+  const m = /^HTTP\/[\d.]+ (\d{3})[^\n]*\r?\n((?:[^\r\n]+\r?\n)*)\r?\n([\s\S]*)$/.exec(s);
+  if (!m) return { status: null, headers: {}, text: s };
+  const headers = {};
+  for (const line of m[2].split(/\r?\n/)) {
+    const i = line.indexOf(':');
+    if (i > 0) headers[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim();
+  }
+  return { status: Number(m[1]), headers, text: m[3] };
+}
+
+/**
+ * One GitHub REST call through `gh api` with worca's credential for `role` (githubEnv: token, split, App or
+ * push-as-person modes alike). `etag` sends If-None-Match; `body` (an object) goes as the JSON request body.
+ * Never throws: { ok, status, json, etag, link, notModified? } | { ok:false, status, class: 'rate-limit'|'auth'|'failed', error, resetAt? }.
+ * `link` is the Link header (pagination), or null. A GET is skipped while the REST core quota is used up (F-X-02);
+ * a rate-limited answer to any method records the window (`resetAt`, ms, when GitHub named it).
+ */
+export async function ghApi({ role = 'read', repo = null, method = 'GET', path, body = null, etag = null, timeout = 30_000 } = {}) {
+  if (!path) return { ok: false, status: null, class: 'failed', error: 'path is required' };
+  if (method === 'GET') {
+    const blocked = quotaBlocked('core', { now: _now() });
+    if (blocked) return { ok: false, status: null, class: 'rate-limit', error: quotaSkipped(blocked.until).stderr, resetAt: blocked.until };
+  }
+  const cred = await githubEnv(role, { repo: ownerRepo(repo) });
+  if (cred.error) return { ok: false, status: null, class: 'auth', error: cred.error };
+  const args = ['api', '--include', '-X', method, '-H', 'Accept: application/vnd.github+json', path];
+  if (etag) args.push('-H', `If-None-Match: ${etag}`);
+  let dir = null;
+  if (body != null) {
+    dir = await mkdtemp(join(tmpdir(), 'worca-ghapi-'));
+    const file = join(dir, 'body.json');
+    await writeFile(file, JSON.stringify(body));
+    args.push('--input', file);
+  }
+  let r;
+  try { r = await _run('gh', args, { env: cred.env, timeout }); }
+  finally { if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {}); }
+  const res = parseGhInclude(r.stdout);
+  if (res.status === 304) return { ok: true, status: 304, notModified: true, json: null, etag };
+  if (r.ok && res.status && res.status < 300) {
+    let parsed = null;
+    try { parsed = res.text.trim() ? JSON.parse(res.text) : null; } catch { parsed = null; }
+    return { ok: true, status: res.status, json: parsed, etag: res.headers.etag || null, link: res.headers.link || null };
+  }
+  const err = (r.stderr || '').trim() || res.text.trim().slice(0, 300) || `gh exited ${r.code}`;
+  const limited = res.status === 429 || (res.status === 403 && res.headers['x-ratelimit-remaining'] === '0') || /rate limit/i.test(err);
+  if (!limited) return { ok: false, status: res.status, class: ghFailureKind(err), error: err };
+  const now = _now();
+  // retry-after first; x-ratelimit-reset only when the primary quota is really spent (remaining 0): on a secondary
+  // limit that header still names the primary window's reset, up to an hour away (D8: a secondary limit waits 60 s).
+  const reset = Number(res.headers['x-ratelimit-reset']), after = Number(res.headers['retry-after']);
+  const remaining = res.headers['x-ratelimit-remaining'];
+  const hasAfter = !!res.headers['retry-after'] && Number.isFinite(after);
+  const secondary = !hasAfter && remaining != null && remaining !== '0';
+  const resetAt = hasAfter ? now + after * 1000
+    : secondary ? now + 60_000
+      : res.headers['x-ratelimit-reset'] && Number.isFinite(reset) ? reset * 1000 : null;
+  const resource = res.headers['x-ratelimit-resource'] === 'graphql' ? 'graphql' : 'core';
+  noteQuotaExhausted(resource, { resetAt, now, source: hasAfter || secondary ? 'secondary' : null });
+  return { ok: false, status: res.status, class: 'rate-limit', error: err, ...(resetAt != null ? { resetAt } : {}) };
+}
+
 export const _testing = {
   defaultRun,
-  setRunner(fn) { _runner = typeof fn === 'function' ? fn : defaultRun; _ghCache = null; },
-  reset() { _runner = defaultRun; _ghCache = null; },
+  // A scripted runner sees today's behaviour: no shared PR-status store, no quota window, unless a test opts in (useDir).
+  setRunner(fn) {
+    _runner = typeof fn === 'function' ? fn : defaultRun; _ghCache = null;
+    if (_runner !== defaultRun) { quotaTesting.suspend(); prStatusTesting.suspend(); }
+  },
+  setNow(fn) { _now = typeof fn === 'function' ? fn : () => Date.now(); },
+  reset() {
+    _runner = defaultRun; _ghCache = null; _now = () => Date.now(); relationCache.clear(); shortstatCache.clear(); aheadCache.clear();
+    quotaTesting.reset(); prStatusTesting.reset();
+  },
 };

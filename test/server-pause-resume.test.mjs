@@ -87,6 +87,14 @@ test('pauseRun signals CANNOT_PAUSE via err.code, not message text', async () =>
   await assert.rejects(async () => _testing.chatActions.pause(runId), (err) => err.code === 'CANNOT_PAUSE');
 });
 
+test('POST /api/pause: a run that is not running -> 400 with code CANNOT_PAUSE and the status it has instead', async () => {
+  const runId = pauseEntry('r-cannot-http', false);
+  runs.get(runId).status = 'paused';   // paused from elsewhere first: the browser keeps its Pausing… quietly
+  const res = await post('/api/pause', { runId });
+  assert.equal(res.status, 400);
+  assert.deepEqual(await res.json(), { error: 'cannot pause in the current state', code: 'CANNOT_PAUSE', status: 'paused' });
+});
+
 test('pauseRun happy path still marks the entry pausing and resolves the pending question', async () => {
   const okRunId = pauseEntry('r-ok', true);
   runs.get(okRunId).pendingQuestion = { id: 'q-1', kind: 'gate' };
@@ -200,4 +208,22 @@ test('POST /api/resume: a v1 resume point is refused with 409 ENGINE_RETIRED', a
   assert.equal(body.error, 'paused on the v1 engine before the graph rework — not resumable');
   assert.equal(getDb().prepare('SELECT status FROM pipelines WHERE id = ?').get(id).status, 'paused',
     'refusing does not mutate the run');
+});
+
+test('POST /api/pause { afterStep: true } calls the flag, leaves the run going, and a second request is 409 ALREADY_PAUSING; a plain pause still pauses at once', async () => {
+  const calls = [];
+  let flagged = false;
+  runs.set('r-after', { id: 'r-after', status: 'running', events: [], pendingQuestion: { id: 'q-9', kind: 'gate' },
+    orch: { pause: () => { calls.push('pause'); return true; }, pauseAfterStep: () => { calls.push('after'); if (flagged) return 'already'; flagged = true; return true; } } });
+  let res = await post('/api/pause', { runId: 'r-after', afterStep: true });
+  assert.deepEqual([res.status, await res.json()], [200, { ok: true }]);
+  assert.equal(runs.get('r-after').status, 'running', 'the step runs on');
+  assert.deepEqual(runs.get('r-after').pendingQuestion, { id: 'q-9', kind: 'gate' }, 'an open question is not resolved');
+  res = await post('/api/pause', { runId: 'r-after', afterStep: true });
+  assert.deepEqual([res.status, await res.json()], [409, { error: 'A pause after this step is already on its way.', code: 'ALREADY_PAUSING' }]);
+  res = await post('/api/pause', { runId: 'r-after' });
+  assert.equal(res.status, 200);
+  assert.equal(runs.get('r-after').status, 'pausing', 'Pause (now) stays offered and pauses at once');
+  assert.deepEqual(calls, ['after', 'after', 'pause']);
+  runs.delete('r-after');
 });

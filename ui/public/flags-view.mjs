@@ -27,10 +27,10 @@ export function flagRowsHtml(flags) {
 /**
  * @param {{host:HTMLElement, msgEl?:HTMLElement, resetBtn?:HTMLButtonElement,
  *          api:(method:string, body?:object)=>Promise<{ok:boolean,status:number,data:any}>,
- *          confirm:(o:object)=>Promise<boolean>}} o
+ *          confirm:(o:object)=>Promise<boolean>, keep?:(flag:object)=>boolean}} o   keep: which rows show (Stillhet's Labs row)
  * @returns {{load:(sub?:string)=>Promise<void>, toggle:(key:string)=>Promise<void>, resetAll:()=>Promise<void>}}
  */
-export function createFlagsView({ host, msgEl = null, resetBtn = null, api, confirm }) {
+export function createFlagsView({ host, msgEl = null, resetBtn = null, api, confirm, keep = () => true }) {
   const doc = host.ownerDocument;
   let flags = [];
   const say = (text, tone = '') => { if (msgEl) { msgEl.textContent = text; msgEl.className = `form-msg${tone ? ` ${tone}` : ''}`; } };
@@ -39,7 +39,7 @@ export function createFlagsView({ host, msgEl = null, resetBtn = null, api, conf
     // A `flags` frame repaints this tab too (app.js); keep the keyboard user's place across it.
     const active = doc.activeElement;
     if (!focusKey && active && host.contains(active) && active.dataset.flagSwitch) focusKey = active.dataset.flagSwitch;
-    host.innerHTML = flagRowsHtml(flags);
+    host.innerHTML = flagRowsHtml(flags.filter(keep));
     applyFlags(Object.fromEntries(flags.map((f) => [f.key, f.on])), doc);
     if (resetBtn) resetBtn.disabled = !flags.some((f) => !f.locked && f.source === 'settings');
     const target = focusKey || (flagByKey(sub) ? sub : null);
@@ -117,7 +117,7 @@ export function createFlagsView({ host, msgEl = null, resetBtn = null, api, conf
 }
 
 /**
- * A single flag's switch outside the Labs page (the account menu's Keep awake row, review F): the same
+ * A single flag's switch outside the Labs page (Settings › Runs › Smart run naming): the same
  * value, one source. `el` is a `.switch[role=switch]`, or a whole `<button>` row (a menuitemcheckbox
  * whose .switch only shows aria-checked). A button turns Enter and Space into a click by itself, so it
  * gets no key handler (one flip per key). The message (a refusal, "Locked by WORCA_FLAGS", '' to clear)

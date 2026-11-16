@@ -22,10 +22,8 @@ import { listModels } from './config.mjs';
 import { resolveRunEngine } from './settings-cascade.mjs';
 import { selectRunEngine } from './engines/index.mjs';
 import { resolveShapeRequest } from './shape/run.mjs';
-import { shapeFirstEnabled } from './shape/gate.mjs';
 import { AUTO_WORKFLOW_ID, WORKSPACE_SCAN_WORKFLOW_ID } from './graph/builtin-workflows.mjs';
 import { readPreset } from './run-presets-store.mjs';
-import { flagEnabled } from './flags.mjs';
 import { addNotification } from './notifications.mjs';
 import { byActor } from './identity.mjs';
 import { bodyFollowingPreset, nodeLabel } from '../shared/run-presets.mjs';
@@ -88,7 +86,7 @@ function effectiveOf(item) {
   const keep = Array.isArray(internal.presetOverrides) ? internal.presetOverrides.filter((k) => typeof k === 'string') : [];
   const overridden = keep.includes('overlay');
   const name = str(internal.presetName) || item.presetId;
-  const preset = flagEnabled('runPresets') ? readPreset(item.presetId, { owner: str(internal.presetOwner) || null }) : null;
+  const preset = readPreset(item.presetId, { owner: str(internal.presetOwner) || null });
   if (!preset) return { request: stored, preset: { id: item.presetId, name, overridden, missing: true } };
   const { presetId: _link, ...request } = bodyFollowingPreset(stored, preset, { keep });
   return { request, preset: { id: preset.id, name: preset.name, overridden, missing: false } };
@@ -98,7 +96,7 @@ function effectiveOf(item) {
  *  assertRunnableWorkflow, runEngineOpts, listModels), with the refusals that apply before any pick is read. */
 async function contextOf({ kind, item }) {
   const { request, preset } = effectiveOf(item);
-  const shape = resolveShapeRequest({ shape: request.shape, workflowId: request.workflowId }, { enabled: shapeFirstEnabled(), internal: true });
+  const shape = resolveShapeRequest({ shape: request.shape, workflowId: request.workflowId }, { internal: true });
   if (!shape.ok) throw new ModelSwitchError('WORKFLOW_GONE', `this run cannot start its workflow: ${shape.error}`);
   const workflowId = shape.workflowId || 'wf_default';
   if (workflowId === AUTO_WORKFLOW_ID) throw new ModelSwitchError('AUTO_WORKFLOW', 'the Auto workflow picks its models when the run starts', 400);

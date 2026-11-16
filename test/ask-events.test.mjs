@@ -428,6 +428,10 @@ test('noise and robustness: ignored frames emit nothing; malformed input never t
     ev({ type: 'stream_event', event: null }), ev({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 7 } } }),
   );
   assert.deepEqual(h.types(), ['ask-label']);
+  const limits = [];
+  const hl = harness({ onLimit: (e) => limits.push(e) });
+  hl.push(ev({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', rateLimitType: 'five_hour', utilization: 0.2, resetsAt: 1790439000 } }));
+  assert.deepEqual([limits.map((e) => e.type), hl.types()], [['limit'], []], 'a limit event reaches onLimit and renders nothing');
   assert.equal(h.r.finish().reducerErrors, 0);
   let calls = 0;
   const bad = createTurnReducer({ onFrame: () => { calls++; throw new Error('ui boom'); }, now: () => 0, setTimeout: () => 1, clearTimeout: () => {} });
@@ -733,6 +737,8 @@ const RESULT_HOOKS = [
     'propose_workspace_change', 'onWorkspaceProposal', { kind: 'add_members', workspaceId: 'wks-demo-0000abcd', projectKeys: ['k1'] }],
   ['propose_scope_switch: labelled, and its RESULT reaches onScopeSwitch with the full input; a sub-agent call never does',
     'propose_scope_switch', 'onScopeSwitch', { candidates: ['havn-android-0000aaaa'], reason: 'Both Havn apps have a booking screen.' }],
+  ['ask_question: labelled, and its RESULT reaches onQuestion with the full input; a sub-agent call never does',
+    'ask_question', 'onQuestion', { answer: 'choice', question: 'Which?', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] }],
   ['propose_project_change: labelled, and its RESULT reaches onProjectProposal with the full input; a sub-agent call never does', 'propose_project_change', 'onProjectProposal', { kind: 'create', name: 'landing-page' }],
   ['show_files: labelled, and its RESULT reaches onShowFiles with the full input; a sub-agent call never does',
     'show_files', 'onShowFiles', { files: [{ path: '$WORCA_ASK_OUT/a.png' }] }],

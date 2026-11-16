@@ -1,16 +1,18 @@
 // ui/public/bridge-view.mjs
 // Pure DOM renderers for the model bridge (model-bridge-design.md §8): the
 // Providers card, the Copilot sign-in block, the Import-from-Copilot sheet,
-// the editor's Connection section, the terms notice text, and the card
+// the editor's Connection section, and the card
 // badges. Same contract as models-view.mjs: every function takes `doc` via
 // opts and returns DETACHED elements; app.js owns endpoint calls, mounting
 // and the delegated listeners. Interactive elements carry a routing class
 // (mv-cp-*, mv-pv-*, mvi-*, mv-conn-*) plus data-provider / data-id.
 
 import { icon } from './icons.mjs';
+import { copyButton, copyFromButton } from './copy-button.mjs';
 import { makeSwitch } from './switch.mjs';
 import { codexReaches, runsOnText } from '../../src/shared/connections.mjs';
 import { SIGN_IN_ENGINE_NAMES } from '../../src/shared/engine-switch.mjs';
+import { IMAGE_SERVICES, originOf, pictureSeconds } from '../../src/shared/image-services.mjs';
 
 function h(doc, tag, cls, text) {
   const n = doc.createElement(tag);
@@ -61,19 +63,6 @@ function stashReasoningEfforts(conn, upstream) {
 }
 export const CAPABILITY_FLAGS = [['toolCalls', 'Tool calls'], ['vision', 'Vision'], ['reasoning', 'Reasoning']];
 
-/** The notice every Copilot sign-in must acknowledge (§8.2). One source of truth: the UI modal and the CLI print it. */
-export const COPILOT_TERMS = Object.freeze({
-  title: 'Using GitHub Copilot from Worca',
-  body: [
-    "Worca will talk to GitHub Copilot through the same API GitHub's editor extensions use, identifying itself as an editor client. GitHub's terms allow Copilot only through supported clients, and GitHub has suspended Copilot access for automated or unsupported use. Pipelines are automated, high-volume use.",
-    '• Your GitHub account, not Worca, carries this risk.',
-    '• Worca caps concurrent requests (configurable) and never signs in without you.',
-    '• Premium-request quotas apply per your plan; Worca shows usage but cannot enforce it.',
-  ].join('\n\n'),
-  checkbox: 'I understand and want to continue',
-  confirm: 'Continue',
-});
-
 /** One-line degradation copy for a translated (openai-chat / openai-responses) model, '' otherwise (§8.5). */
 export function degradationLine(m) {
   // A Codex model is not translated: codex speaks the endpoint's Responses API itself.
@@ -106,7 +95,7 @@ export function bridgedBadge(m, { doc = globalThis.document } = {}) {
 export function needsSignInPill(m, { doc = globalThis.document } = {}) {
   if (!m || !m.needsSignIn) return null;
   const wrap = h(doc, 'span', 'mv-needs-signin');
-  const b = h(doc, 'span', 'badge red mv-needs-signin-badge', m.signInReason === 'terms' ? 'needs acknowledgement' : m.signInReason === 'no_key' ? 'needs API key' : 'needs sign-in');
+  const b = h(doc, 'span', 'badge red mv-needs-signin-badge', m.signInReason === 'no_key' ? 'needs API key' : 'needs sign-in');
   b.title = m.signInMessage || 'The provider behind this model is not usable yet.';
   wrap.appendChild(b);
   const btn = h(doc, 'button', 'btn mv-signin', m.signInReason === 'no_key' ? 'Set key' : 'Sign in');
@@ -119,14 +108,6 @@ export function needsSignInPill(m, { doc = globalThis.document } = {}) {
 // ── Providers card (§8.1) ────────────────────────────────────────────────────
 
 function providerStatePill(doc, c) {
-  if (!c.termsCurrent) {
-    // What unblocks sign-in, in the "Read notice" button's own words — and it opens that notice.
-    const pill = h(doc, 'button', 'btn btn-sm btn-quiet mv-cp-terms mv-cp-terms-pill',
-      c.acknowledgedTerms ? 'please re-read the updated notice' : 'please read the notice first');
-    pill.type = 'button';
-    pill.title = 'Sign-in is blocked until you acknowledge the GitHub Copilot notice. Click to read it.';
-    return pill;
-  }
   if (!c.connected) return h(doc, 'span', 'badge grey', 'not connected');
   return h(doc, 'span', 'badge green', `connected${c.login ? ` as @${c.login}` : ''}`);
 }
@@ -305,6 +286,147 @@ function renderSpeechRow(doc, sp) {
   return row;
 }
 
+function imagesBadge(doc, im) {
+  if (im.keyMissing) return h(doc, 'span', 'badge red', 'key missing');
+  if (im.configured) return h(doc, 'span', 'badge green', 'ready');
+  return h(doc, 'span', 'badge grey', 'not set up');
+}
+
+function imagesField(doc, field, label, ctl, cls = '') {
+  const wrap = h(doc, 'label', `mv-field${cls ? ` ${cls}` : ''}`);
+  wrap.appendChild(h(doc, 'span', 'mv-field-label', label));
+  ctl.dataset.field = field;
+  wrap.appendChild(ctl);
+  return wrap;
+}
+
+function imagesInput(doc, field, value) {
+  const inp = h(doc, 'input', `input mv-im-field${field === 'apiKey' ? ' mv-pv-key' : ''}`);
+  inp.type = 'text';
+  inp.value = value;
+  return inp;
+}
+
+/**
+ * The Image generation row (Design pictures): the service a Design lead's pictures are made by. Never a model
+ * upstream. What it renders with is kept on the row (data-stored-*), so a re-pick of the saved service brings
+ * the saved values back and a switch to another address never carries the stored key along.
+ */
+function renderImagesRow(doc, im) {
+  const service = im.service || 'openai';
+  const preset = IMAGE_SERVICES[service] || {};
+  const baseUrl = String(im.baseUrl ?? preset.baseUrl ?? '');
+  const model = String(im.model ?? preset.model ?? '');
+  const price = String(im.price ?? preset.price ?? '');
+  const row = h(doc, 'div', 'mv-pv-row mv-im-row');
+  row.dataset.provider = 'images';
+  row.dataset.storedOrigin = originOf(im.baseUrl);
+  row.dataset.storedService = service;
+  row.dataset.storedBaseUrl = baseUrl;
+  row.dataset.storedModel = model;
+  row.dataset.storedPrice = price;
+  const main = h(doc, 'div', 'mv-pv-main');
+  const head = h(doc, 'div', 'mv-head');
+  head.appendChild(h(doc, 'b', 'mv-name', 'Image generation (Design)'));
+  head.appendChild(imagesBadge(doc, im));
+  main.appendChild(head);
+  main.appendChild(h(doc, 'small', 'hint', 'Lets a Design lead have a picture made when no real one fits. The key stays on this machine.'));
+  main.appendChild(h(doc, 'small', 'hint mv-pv-msg'));
+  // The Test picture's answer: the picture whole, and how long it took, or the reason it failed.
+  const result = h(doc, 'div', 'mv-im-result');
+  result.hidden = true;
+  result.setAttribute('role', 'status');
+  const shot = h(doc, 'img', 'mv-im-shot');
+  shot.alt = 'Test picture';
+  result.appendChild(shot);
+  result.appendChild(h(doc, 'small', 'hint mv-im-made'));
+  main.appendChild(result);
+  row.appendChild(main);
+
+  const ctl = h(doc, 'div', 'mv-pv-ctl');
+  const sel = h(doc, 'select', 'input mv-im-field mv-im-service');
+  for (const s of Object.values(IMAGE_SERVICES)) {
+    const o = h(doc, 'option', '', s.label);
+    o.value = s.id;
+    sel.appendChild(o);
+  }
+  sel.value = service;
+  ctl.appendChild(imagesField(doc, 'service', 'Service', sel));
+  ctl.appendChild(imagesField(doc, 'baseUrl', 'Base URL', imagesInput(doc, 'baseUrl', baseUrl)));
+  ctl.appendChild(imagesField(doc, 'model', 'Model', imagesInput(doc, 'model', model)));
+  const key = imagesInput(doc, 'apiKey', im.keyRef || im.keyMasked || '');
+  if (key.value) key.dataset.original = key.value;
+  key.placeholder = 'sk-…, or ${VAR} to read your shell env';
+  ctl.appendChild(imagesField(doc, 'apiKey', 'API key', key, 'mv-im-key'));
+  const priceIn = imagesInput(doc, 'price', price);
+  priceIn.setAttribute('inputmode', 'decimal');
+  ctl.appendChild(imagesField(doc, 'price', 'Price per picture ($)', priceIn, 'mv-im-price'));
+  row.appendChild(ctl);
+
+  const btns = h(doc, 'div', 'mv-pv-btns');
+  btns.dataset.cardActions = '';
+  const test = h(doc, 'button', 'btn mv-im-test', 'Test picture');
+  test.type = 'button';
+  btns.appendChild(test);
+  const save = h(doc, 'button', 'btn btn-primary mv-im-save', 'Save');
+  save.type = 'button';
+  btns.appendChild(save);
+  row.appendChild(btns);
+  return row;
+}
+
+function soundBadge(doc, so) {
+  if (!so.keySet) return h(doc, 'span', 'badge grey', 'not set up');
+  if (so.keyMissing) return h(doc, 'span', 'badge red', 'key missing');
+  return h(doc, 'span', 'badge green', 'ready');
+}
+
+/**
+ * The Sound row (Design sound): the ElevenLabs key a Design video's voice and music are made with. One field;
+ * its original value is kept even when empty, so an untouched field never collects as a cleared key.
+ */
+function renderSoundRow(doc, so) {
+  const row = h(doc, 'div', 'mv-pv-row mv-so-row');
+  row.dataset.provider = 'sound';
+  const main = h(doc, 'div', 'mv-pv-main');
+  const head = h(doc, 'div', 'mv-head');
+  head.appendChild(h(doc, 'b', 'mv-name', 'Sound (Design)'));
+  head.appendChild(soundBadge(doc, so));
+  main.appendChild(head);
+  main.appendChild(h(doc, 'small', 'hint', 'Gives a Design video a voice and music through ElevenLabs. The key stays on this machine.'));
+  main.appendChild(h(doc, 'small', 'hint mv-pv-msg'));
+  // The Test's answer: how many voices the key reaches, or the reason it failed.
+  const result = h(doc, 'small', 'hint mv-so-result');
+  result.hidden = true;
+  result.setAttribute('role', 'status');
+  main.appendChild(result);
+  row.appendChild(main);
+
+  const ctl = h(doc, 'div', 'mv-pv-ctl');
+  const field = h(doc, 'label', 'mv-field mv-so-key');
+  field.appendChild(h(doc, 'span', 'mv-field-label', 'ElevenLabs API key'));
+  const key = h(doc, 'input', 'input mv-pv-key');
+  key.type = 'password';
+  key.setAttribute('autocomplete', 'off');
+  key.placeholder = 'sk_…';
+  key.value = so.keyRef || so.keyMasked || '';
+  key.dataset.original = key.value;
+  field.appendChild(key);
+  ctl.appendChild(field);
+  row.appendChild(ctl);
+
+  const btns = h(doc, 'div', 'mv-pv-btns');
+  btns.dataset.cardActions = '';
+  const test = h(doc, 'button', 'btn mv-so-test', 'Test');
+  test.type = 'button';
+  btns.appendChild(test);
+  const save = h(doc, 'button', 'btn btn-primary mv-so-save', 'Save');
+  save.type = 'button';
+  btns.appendChild(save);
+  row.appendChild(btns);
+  return row;
+}
+
 /**
  * The Providers card. `providers` is GET /api/providers' payload (never a
  * token). `signIn` is an in-flight device-flow {userCode, verificationUri,
@@ -312,7 +434,7 @@ function renderSpeechRow(doc, sp) {
  */
 export function renderProvidersCard(providers, { doc = globalThis.document, signIn = null, split = false } = {}) {
   const p = providers || {};
-  const c = p.copilot || { connected: false, termsCurrent: false, accountType: 'individual', maxConcurrent: 4 };
+  const c = p.copilot || { connected: false, accountType: 'individual', maxConcurrent: 4 };
   // On the Providers page the card holds one divided row per provider (docs/design-system.md ›
   // Cards versus divided rows); inside the Models view (the old home) it is the headed card. Either
   // way the rows keep their shape, so every flow that finds .mv-pv-row[data-provider] is unaffected.
@@ -325,7 +447,7 @@ export function renderProvidersCard(providers, { doc = globalThis.document, sign
       "Providers let Worca run models that don't speak the Anthropic API. Worca runs them through its own in-process bridge. Sign in or set a key once; then import or add models on the Models page and pick them anywhere a model is picked."));
   }
   // Credential broker: keys and the Copilot sign-in are per person, on the broker's key page.
-  // This card keeps the shared settings (base URLs, concurrency, the Copilot notice, imports);
+  // This card keeps the shared settings (base URLs, concurrency, imports);
   // its key fields, sign-in and key test are hidden (style.css .mv-providers--broker).
   if (p.broker && p.broker.enabled) {
     root.classList.add('mv-providers--broker');
@@ -352,13 +474,11 @@ export function renderProvidersCard(providers, { doc = globalThis.document, sign
   const cpHead = h(doc, 'div', 'mv-head');
   cpHead.appendChild(h(doc, 'b', 'mv-name', 'GitHub Copilot'));
   const brokered = !!(p.broker && p.broker.enabled);
-  // The notice gates Copilot models either way; past it, the broker's view of your sign-in.
-  cpHead.appendChild(brokered && c.termsCurrent ? brokerPill(doc, p.broker, 'copilot') : providerStatePill(doc, c));
+  // With the broker, the broker's view of your sign-in.
+  cpHead.appendChild(brokered ? brokerPill(doc, p.broker, 'copilot') : providerStatePill(doc, c));
   cpMain.appendChild(cpHead);
   cpMain.appendChild(h(doc, 'small', 'hint',
-    c.acknowledgedTerms
-      ? `Notice acknowledged on ${String(c.acknowledgedTerms).slice(0, 10)}${c.termsCurrent ? '' : ' (the wording changed, please re-read)'}. Claude models run through Copilot's native Anthropic endpoint (thinking intact); other vendors run through a translation layer.`
-      : 'Uses your Copilot subscription for GPT, Gemini, Grok and Claude models. Sign in reads the GitHub notice first.'));
+    "Uses your Copilot subscription for GPT, Gemini, Grok and Claude models. Claude models run through Copilot's native Anthropic endpoint (thinking intact); other vendors run through a translation layer."));
   if (c.tokenSource === 'env') cpMain.appendChild(h(doc, 'small', 'hint', `Token read from your shell env (${c.tokenRef}).`));
   const flow = h(doc, 'div', 'mv-cp-flow');
   if (signIn) flow.appendChild(renderCopilotSignIn(signIn, { doc }));
@@ -403,9 +523,6 @@ export function renderProvidersCard(providers, { doc = globalThis.document, sign
     inBtn.type = 'button';
     cpBtns.appendChild(inBtn);
   }
-  const terms = h(doc, 'button', 'btn mv-cp-terms', c.acknowledgedTerms ? 'Re-read notice' : 'Read notice');
-  terms.type = 'button';
-  cpBtns.appendChild(terms);
   cp.appendChild(cpBtns);
   place(cp);
 
@@ -479,6 +596,8 @@ export function renderProvidersCard(providers, { doc = globalThis.document, sign
     place(row);
   }
   place(renderSpeechRow(doc, p.speech || {}));
+  place(renderImagesRow(doc, p.images || {}));
+  place(renderSoundRow(doc, p.sound || {}));
   return root;
 }
 
@@ -538,48 +657,120 @@ export function collectSpeechRow(rootEl) {
   return body;
 }
 
-/** The device-flow block: the code in large type, copy, the link, a live status line, cancel (§8.1). */
-export const COPY_DONE_MS = 2000;
-/** The pre-Clipboard-API copy: browsers hide navigator.clipboard on plain http away from localhost (a LAN address). */
-function copyByCommand(doc, text) {
-  const ta = doc.createElement('textarea');
-  ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
-  doc.body.append(ta); ta.select();
-  let ok = false;
-  try { ok = doc.execCommand?.('copy') === true; } catch { ok = false; }
-  ta.remove();
-  return ok;
+const imagesRowOf = (rootEl) => rootEl.querySelector('.mv-pv-row[data-provider="images"]');
+
+/**
+ * Pick a service on the Image generation row: its Base URL, Model and Price fill in (a preset with no price
+ * leaves Price empty). The key stays only when the preset's address has the stored key's origin; the saved
+ * service brings back what was saved, key included. Nothing is saved. False for an unknown service.
+ */
+export function applyImagesPreset(rootEl, id) {
+  const row = imagesRowOf(rootEl);
+  if (!row || !Object.hasOwn(IMAGE_SERVICES, id)) return false;
+  const f = (k) => row.querySelector(`.mv-im-field[data-field="${k}"]`);
+  const ds = row.dataset;
+  const original = f('apiKey').dataset.original || '';
+  f('service').value = id;
+  if (id === ds.storedService) {
+    f('baseUrl').value = ds.storedBaseUrl || '';
+    f('model').value = ds.storedModel || '';
+    f('price').value = ds.storedPrice || '';
+    f('apiKey').value = original;
+    return true;
+  }
+  const preset = IMAGE_SERVICES[id];
+  const origin = originOf(preset.baseUrl);
+  f('baseUrl').value = preset.baseUrl;
+  f('model').value = preset.model;
+  f('price').value = preset.price == null ? '' : String(preset.price);
+  f('apiKey').value = origin && origin === ds.storedOrigin ? original : '';
+  return true;
 }
-/** Copy code: the app's copy-button pattern (copy icon, a green tick and "Copied" once done, as the branch copy
- *  buttons). It copies by itself, so the box works wherever it is mounted (Providers, the setup assistant). */
-function copyCodeButton(doc, code) {
-  const b = h(doc, 'button', 'btn mv-cp-copy');
-  b.type = 'button'; b.dataset.code = code;
-  const label = h(doc, 'span', 'mv-cp-copy-label', 'Copy code');
-  b.append(icon(doc, 'copy', 14, 'ic ico-copy'), icon(doc, 'check', 14, 'ic ico-check'), label);
-  let timer = null;
+
+/** Collect the Image generation row into PATCH /api/providers/images' body (masked/unchanged key omitted). */
+export function collectImagesRow(rootEl) {
+  const row = imagesRowOf(rootEl);
+  if (!row) return null;
+  const body = {};
+  for (const inp of row.querySelectorAll('.mv-im-field')) {
+    const { field } = inp.dataset;
+    const v = inp.value.trim();
+    if (field === 'apiKey') { if (v !== (inp.dataset.original || '')) body.apiKey = v; continue; }
+    if (field === 'price') {
+      // A number goes as one; anything else as typed, which the server refuses in its own words.
+      const n = Number(v);
+      body.price = v === '' ? '' : Number.isFinite(n) ? n : v;
+      continue;
+    }
+    body[field] = v;
+  }
+  return body;
+}
+
+/** Collect the Sound row into PATCH /api/providers/sound's body: {} while the key is untouched, else { apiKey }
+ *  ('' for a cleared field). */
+export function collectSoundRow(rootEl) {
+  const row = rootEl.querySelector('.mv-pv-row[data-provider="sound"]');
+  if (!row) return null;
+  const key = row.querySelector('.mv-pv-key');
+  const v = key.value.trim();
+  return v === key.dataset.original ? {} : { apiKey: v };
+}
+
+/** The Test picture's answer, in the row: the picture and "Made in n s · w×h", or the reason in red. */
+export function showImagesTest(rootEl, r) {
+  const row = imagesRowOf(rootEl);
+  if (!row) return;
+  const shot = row.querySelector('.mv-im-shot');
+  const line = row.querySelector('.mv-im-made');
+  row.querySelector('.mv-im-result').hidden = false;
+  if (r && r.ok) {
+    shot.src = r.dataUrl;
+    shot.hidden = false;
+    line.className = 'hint mv-im-made';
+    line.textContent = `Made in ${pictureSeconds(r.ms)} s · ${r.w}×${r.h}`;
+    return;
+  }
+  shot.hidden = true;
+  shot.removeAttribute('src');
+  line.className = 'hint err mv-im-made';
+  line.textContent = (r && r.message) || '';
+}
+
+/** A refused Save of the Image generation row, in the row's own line and announced (not the card's alert). */
+export function showImagesSaveError(rootEl, message) {
+  const row = imagesRowOf(rootEl);
+  const line = row && row.querySelector('.mv-pv-msg');
+  if (!line) return;
+  line.textContent = message;
+  line.className = 'hint err mv-pv-msg';
+  line.setAttribute('role', 'alert');
+}
+
+/** The code is its own copy button (copy-button.mjs: the code as the label, then a green tick and "Copied"), the one
+ *  step of the box. It copies by itself, so the box works wherever it is mounted (Providers, the setup assistant).
+ *  A failure stays in the box's status line: a button's text cannot be selected, so it says to type the code. */
+function copyCodeButton(doc, code, status) {
+  const b = copyButton(doc, { name: `Copy code ${code}`, label: code, title: 'Copy code', cls: 'mv-cp-copy' });
+  b.querySelector('.copy-btn-text').classList.add('mv-cp-code');
+  b.dataset.code = code;
   b.addEventListener('click', async () => {
-    const win = doc.defaultView;
-    let ok = false;
-    try { await win.navigator.clipboard.writeText(code); ok = true; } catch { ok = copyByCommand(doc, code); }   // no API: plain http on another host
-    b.classList.toggle('copied', ok);
-    label.textContent = ok ? 'Copied' : 'Copy failed: select the code';
-    win.clearTimeout(timer);
-    timer = win.setTimeout(() => { b.classList.remove('copied'); label.textContent = 'Copy code'; }, COPY_DONE_MS);
+    if (await copyFromButton(b, code, { empty: 'No code yet' })) return;
+    status.textContent = code ? `Could not copy the code. Type ${code} on GitHub instead.` : 'No code yet.';
+    status.classList.add('err');
   });
   return b;
 }
 
-// In the order it is used: the code and Copy as one group, then Open (the primary step); below, the wait (a spinner
-// while it lasts) with Cancel on the same line. Every control is the same 32px tall, the code included.
+// In the order it is used: the code (its own copy button), then Open (the primary step); below, the wait (a spinner
+// while it lasts) with Cancel on the same line.
 export function renderCopilotSignIn(flow, { doc = globalThis.document } = {}) {
   const box = h(doc, 'div', 'mv-cp-signin-box');
   box.appendChild(h(doc, 'small', 'hint', 'Copy this code, then enter it on GitHub to connect your Copilot account.'));
+  const status = h(doc, 'small', `hint mv-cp-status${flow.error ? ' err' : ''}`, flow.error || flow.status || 'Waiting for approval…');
+  status.setAttribute('role', 'status');
   const codeRow = h(doc, 'div', 'mv-cp-code-row');
-  const group = h(doc, 'div', 'mv-cp-code-group');
-  group.appendChild(h(doc, 'code', 'mv-cp-code', flow.userCode || ''));
-  group.appendChild(copyCodeButton(doc, flow.userCode || ''));
-  codeRow.appendChild(group);
+  codeRow.appendChild(copyCodeButton(doc, flow.userCode || '', status));
   const link = h(doc, 'a', 'btn btn-primary mv-cp-open', 'Open github.com/login/device');
   link.href = flow.verificationUri || 'https://github.com/login/device';
   link.target = '_blank'; link.rel = 'noopener';
@@ -588,8 +779,6 @@ export function renderCopilotSignIn(flow, { doc = globalThis.document } = {}) {
   const foot = h(doc, 'div', 'mv-cp-foot');
   const wait = h(doc, 'div', 'mv-cp-wait');
   if (!flow.error) { const spin = h(doc, 'span', 'mk-phase-spin'); spin.setAttribute('aria-hidden', 'true'); wait.appendChild(spin); }
-  const status = h(doc, 'small', `hint mv-cp-status${flow.error ? ' err' : ''}`, flow.error || flow.status || 'Waiting for approval…');
-  status.setAttribute('role', 'status');
   wait.appendChild(status);
   const cancel = h(doc, 'button', 'btn btn-quiet mv-cp-cancel', flow.error ? 'Dismiss' : 'Cancel');
   cancel.type = 'button';

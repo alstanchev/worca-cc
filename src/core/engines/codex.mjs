@@ -19,7 +19,8 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync, symlinkSync, rmSync, renameSync, readdirSync, linkSync, copyFileSync, lstatSync, readlinkSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
-import { execFile } from 'node:child_process';
+import { execCli, cliRefusal } from './exec-cli.mjs';
+import { CODEX_CLI } from './cli-specs.mjs';
 import { join, resolve, dirname, relative } from 'node:path';
 import { worcaHome } from '../projects.mjs';
 import { hostGuardEnabled, hostGuardSystemPrompt } from '../host-guard.mjs';
@@ -35,6 +36,10 @@ import { chatEnginesTaking } from '../../shared/engine-switch.mjs';
 import { scopeLauncherEnv } from '../mcp/launch.mjs';
 
 export const CODEX_DEFAULT_BIN = process.env.WORCA_CODEX_BIN || 'codex';
+
+/** The instruction files Codex reads from its cwd (checked against codex-cli 0.146/0.154), in its order: Codex
+ *  reads only the first non-empty one per directory (learn.chatgpt.com/docs/agent-configuration/agents-md). */
+export const CODEX_INSTRUCTION_FILES = Object.freeze(['AGENTS.override.md', 'AGENTS.md']);
 
 /** Stored session ids are engine-qualified so a resume never hands a codex
  *  thread to claude (or a claude session to codex). */
@@ -241,6 +246,22 @@ function knownCodexHomes() {
   let managed = [];
   try { managed = readdirSync(base, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => join(base, e.name)); } catch { /* none yet */ }
   return [userCodexHome(), ...managed];
+}
+
+/**
+ * Deletes the session file of that one thread id under every known codex home (9c D12: a helper call leaves no copy of
+ * a step in codex's history). Nothing else is touched. Never throws; true when at least one file was removed.
+ */
+export function removeCodexThread(thread, { homes } = {}) {
+  let removed = false;
+  try {
+    for (const h of homes ?? knownCodexHomes()) {
+      const f = findCodexRollout(h, thread);
+      if (!f) continue;
+      try { rmSync(f, { force: true }); removed = true; } catch { /* kept: the notice says so */ }
+    }
+  } catch { /* never throws */ }
+  return removed;
 }
 
 /**
@@ -687,10 +708,10 @@ export function parseLoginStatus({ code, stdout = '', stderr = '' } = {}) {
  */
 export function codexPreflight({ bin = CODEX_DEFAULT_BIN, timeoutMs = 10000, signIn = true } = {}) {
   return new Promise((resolve) => {
-    execFile(bin, ['login', 'status'], { timeout: timeoutMs }, (err, stdout, stderr) => {
+    execCli(CODEX_CLI, bin, ['login', 'status'], { timeout: timeoutMs }, (err, stdout, stderr) => {
       if (err && typeof err.code !== 'number') {
         resolve(/^(ENOENT|EACCES|EINVAL)$/.test(String(err.code))
-          ? { refusal: `cannot run ${bin} (${err.code}) — install codex, or point WORCA_CODEX_BIN at it` }
+          ? { refusal: cliRefusal({ bin, err, install: 'install codex, or point WORCA_CODEX_BIN at it' }) }
           : { warning: `could not check the codex sign-in (${err.message})` });
         return;
       }
@@ -716,9 +737,9 @@ export function parseCodexFeatures(stdout = '') {
  */
 export function codexAskSupport({ bin = CODEX_DEFAULT_BIN, timeoutMs = 10000 } = {}) {
   return new Promise((resolve) => {
-    execFile(bin, ['features', 'list'], { timeout: timeoutMs }, (err, stdout) => {
+    execCli(CODEX_CLI, bin, ['features', 'list'], { timeout: timeoutMs }, (err, stdout) => {
       if (err && typeof err.code !== 'number') {
-        resolve({ refusal: /^(ENOENT|EACCES|EINVAL)$/.test(String(err.code)) ? `cannot run ${bin} (${err.code}) — install codex, or point WORCA_CODEX_BIN at it` : `could not ask ${bin} which features it has (${err.message})` });
+        resolve({ refusal: /^(ENOENT|EACCES|EINVAL)$/.test(String(err.code)) ? cliRefusal({ bin, err, install: 'install codex, or point WORCA_CODEX_BIN at it' }) : `could not ask ${bin} which features it has (${err.message})` });
         return;
       }
       const have = err ? new Set() : parseCodexFeatures(stdout);
@@ -835,6 +856,7 @@ export async function runCodexProcess({
   const { env } = composeSpawnEnv({ ...envOpts, ...(Object.keys(ownEnv).length ? { runEnv: ownEnv } : {}) });
   // P3-D20: the run env stays out of this child's env (its shell would read the registry secrets), but the git ceiling
   // of a run without a project is no secret and must reach the agent's own git.
+  if (typeof runSpawnEnv?.TMPDIR === 'string') env.TMPDIR = runSpawnEnv.TMPDIR;   // the run's scratch folder, no secret
   if (typeof runSpawnEnv?.GIT_CEILING_DIRECTORIES === 'string') env.GIT_CEILING_DIRECTORIES = runSpawnEnv.GIT_CEILING_DIRECTORIES;
   // Command rules live in a worca-managed CODEX_HOME.
   if (plan.prefixes.length) env.CODEX_HOME = guardedCodexHome(codexRulesFile(plan.prefixes));
@@ -890,6 +912,7 @@ export async function runCodexProcess({
   let toolCalls = 0; let capped = false;
   const spawnSignal = cap ? (signal ? AbortSignal.any([signal, capCtrl.signal]) : capCtrl.signal) : signal;
   const res = await superviseSpawn({
+    cli: CODEX_CLI,
     file: bin, args, displayBin: bin, cwd, env, stdin, signal: spawnSignal, asAgent, stagedDir: null, onEvent,
     cleanup: () => { if (roleFile) rmSync(roleFile, { force: true }); },
     stdoutErrorDetail: () => normalizer.finish().error || '',
@@ -946,7 +969,7 @@ export const codexChat = makeChatDescriptor({
   // OpenAI's list price, unless the model runs on an endpoint of its own (its Models page price then, or none).
   listRates: (model) => { const m = model || CODEX_DEFAULT_MODEL; return findCodexEndpointEntry(m) ? null : openaiListRates(m); },
   resumeNotFound: codexResumeNotFound,
-  shellTrippedMessage: 'Codex tried to run a shell command although its shell was switched off — worca stopped the turn.',
+  shellTrippedMessage: 'OpenAI Codex tried to run a shell command although its shell was switched off — worca stopped the turn.',
   titles: true,
   suggestionModel: 'gpt-5.6-luna',
   turnImages: true,

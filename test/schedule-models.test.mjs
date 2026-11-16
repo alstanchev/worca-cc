@@ -18,15 +18,12 @@ import { describeScheduledModels, switchScheduledModels, scheduledPickText, writ
 
 useTempHome(after);
 let DIR;
-const prevFlags = process.env.WORCA_FLAGS;
 before(async () => {
-  process.env.WORCA_FLAGS = 'runPresets';   // a follower's preset is read only while run presets are on (fireTicket's rule; the flag defaults on)
   DIR = gitDir('sched-models');
   await addProject({ name: 'sched-models', path: DIR });
   await setNodeModel(DIR, 'wf_default', 'n_impl', { model: 'claude-opus-5-5', effort: 'high' });   // a project default
 });
 after(async () => {
-  if (prevFlags === undefined) delete process.env.WORCA_FLAGS; else process.env.WORCA_FLAGS = prevFlags;
   if (DIR) await rm(DIR, { recursive: true, force: true, maxRetries: 10 });
 });
 
@@ -97,7 +94,7 @@ test('switch: merges per key, clears on "", stores the checker\'s canonical node
 
 test('switch refuses what the run route refuses — and a sub-agent effort, an unknown stage, a Codex sub-agent model', async () => {
   const t = once();
-  await rejects(switchScheduledModels(t.id, { changes: { n_plan: { model: 'gpt-5.5' } } }), 'INVALID_SELECTION', /node "n_plan": gpt-5\.5 runs on Codex, not on Claude/);
+  await rejects(switchScheduledModels(t.id, { changes: { n_plan: { model: 'gpt-5.5' } } }), 'INVALID_SELECTION', /node "n_plan": gpt-5\.5 runs on OpenAI Codex, not on Claude Code/);
   await rejects(switchScheduledModels(t.id, { changes: { n_plan: { effort: 'high' } } }), 'INVALID_SELECTION', /node "n_plan": an effort needs a model/);
   await rejects(switchScheduledModels(t.id, { changes: { n_plan: { model: 'claude-opus-5-5', effort: 'extreme' } } }), 'INVALID_SELECTION', /node "n_plan": model claude-opus-5-5 has no effort "extreme"/);
   await rejects(switchScheduledModels(t.id, { changes: { n_plan: { subagentModel: 'gpt' } } }), 'INVALID_SELECTION', /node "n_plan": unknown sub-agent model "gpt"/);   // the shape pass
@@ -106,7 +103,7 @@ test('switch refuses what the run route refuses — and a sub-agent effort, an u
   await rejects(switchScheduledModels(t.id, { changes: { n_plan: { fanOut: true } } }), 'BAD_FIELD', /"fanOut" cannot be changed/);
   await rejects(switchScheduledModels(t.id, { changes: {} }), 'BAD_REQUEST');
   const codex = once(REQ({ engine: 'codex' }));
-  await rejects(switchScheduledModels(codex.id, { changes: { n_plan: { subagentModel: 'opus' } } }), 'INVALID_SELECTION', /Planner: Codex does not take a sub-agent model/);
+  await rejects(switchScheduledModels(codex.id, { changes: { n_plan: { subagentModel: 'opus' } } }), 'INVALID_SELECTION', /Planner: OpenAI Codex does not take a sub-agent model/);
   assert.equal('overlay' in storedOf(t.id), false, 'a refusal writes nothing');
   assert.equal(changedRows(t.id).length, 0);
 });

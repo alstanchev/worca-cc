@@ -7,17 +7,16 @@
 // test/ui-budget-indicator.test.mjs; the away row is test/ui-night-mode.test.mjs.
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { JSDOM } from 'jsdom';
 import { minLevelFor } from '../ui/public/ui-level.mjs';
-import { applyFlags, flagOn } from '../ui/public/flags.mjs';
 import { useDomRelease } from './helpers/jsdom-release.mjs';
 import { checkRows } from './helpers/rows.mjs';
+import { readIndexHtml } from '../src/core/read-index-html.mjs';
+import { readStyleCss } from '../src/core/read-style-css.mjs';
 
-const htmlPath = fileURLToPath(new URL('../ui/public/index.html', import.meta.url));
 const appPath = fileURLToPath(new URL('../ui/public/app.js', import.meta.url));
-const css = readFileSync(new URL('../ui/public/style.css', import.meta.url), 'utf8');
+const css = readStyleCss();
 const trackDom = useDomRelease(afterEach);
 const DAY = 86400000;
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -28,10 +27,10 @@ const BUDGET = () => ({ totalLimitUsd: 50, resetPeriod: 'monthly', windowStartMs
 const FREE = { enabled: true, known: true, limit: 50, remaining: 4, resetAt: new Date(Date.now() + 3 * 3600000).toISOString(), models: [] };
 
 // width: a viewport (the nav tiers read `(max-width: …)` queries); hover: a mouse (`(hover: hover)` matches);
-// budget: false makes GET /api/budget fail (no snapshot ever arrives). keepAwake: the flag GET /api/flags reports;
-// flagsPatch: 'ok', or the { status, error } the server answers a PATCH /api/flags with.
-async function boot({ whoami = { name: 'ada.lovelace@acme.dev', source: 'access', shared: true }, free = FREE, width = null, hover = false, budget = true, levelSave = 'ok', keepAwake = { on: true, locked: false }, flagsPatch = 'ok' } = {}) {
-  const dom = trackDom(new JSDOM(readFileSync(htmlPath, 'utf8'), { url: 'http://localhost:4317/', pretendToBeVisual: true }));
+// budget: false makes GET /api/budget fail (no snapshot ever arrives). keepAwake: the setting GET /api/settings reports;
+// keepAwakeSave: 'ok', or the { status, error } the server answers a {keepAwake} save with.
+async function boot({ whoami = { name: 'ada.lovelace@acme.dev', source: 'access', shared: true }, free = FREE, width = null, hover = false, budget = true, levelSave = 'ok', keepAwake = true, keepAwakeSave = 'ok' } = {}) {
+  const dom = trackDom(new JSDOM(readIndexHtml(), { url: 'http://localhost:4317/', pretendToBeVisual: true }));
   const { window } = dom;
   window.Element.prototype.scrollIntoView = function () {};
   if (width || hover) {
@@ -44,27 +43,20 @@ async function boot({ whoami = { name: 'ada.lovelace@acme.dev', source: 'access'
   window.__budgetTickMs = DAY;
   window.WebSocket = class { constructor() { this.readyState = 1; } send() {} close() {} addEventListener() {} };
   const posts = [];
-  const patches = [];
   window.fetch = (u, opts = {}) => {
     const url = String(u);
     const ok = (body) => Promise.resolve({ ok: true, status: 200, json: async () => body });
     const method = (opts.method || 'GET').toUpperCase();
-    if (url.endsWith('/api/flags')) {
-      if (method === 'PATCH') {
-        const body = JSON.parse(opts.body);
-        patches.push(body);
-        return flagsPatch === 'ok' ? ok({ flags: [{ key: 'keepAwake', on: body.keepAwake, locked: false }] })
-          : Promise.resolve({ ok: false, status: flagsPatch.status, json: async () => ({ error: flagsPatch.error }) });
-      }
-      return ok({ flags: [{ key: 'keepAwake', ...keepAwake }] });
-    }
+    if (url.endsWith('/api/flags')) return ok({ flags: [] });
     if (method === 'POST') {
       const body = JSON.parse(opts.body);
       posts.push({ url, body });
       // levelSave: 'ok', or the error the server answers a {uiLevel} save with.
       if (body.uiLevel && levelSave !== 'ok') return Promise.resolve({ ok: false, status: 500, json: async () => ({ error: levelSave }) });
+      if ('keepAwake' in body && keepAwakeSave !== 'ok') return Promise.resolve({ ok: false, status: keepAwakeSave.status, json: async () => ({ error: keepAwakeSave.error }) });
       return ok(body);
     }
+    if (url.endsWith('/api/settings')) return ok({ keepAwake, chat: {} });
     if (url.endsWith('/api/whoami')) return ok(whoami);
     if (url.includes('/api/budget')) return budget ? ok(BUDGET()) : Promise.resolve({ ok: false, status: 500, json: async () => ({ error: 'boom' }) });
     if (url.includes('/api/openrouter/free-daily')) return ok(free || { enabled: false });
@@ -83,7 +75,7 @@ async function boot({ whoami = { name: 'ada.lovelace@acme.dev', source: 'access'
   const click = (el, detail = 1) => el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true, detail }));
   // Keys go where focus is, as in a browser (the menu reads its arrows on itself; Escape is the document's).
   const key = (k) => (doc.activeElement || doc.body).dispatchEvent(new window.KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
-  return { window, doc, $, click, key, posts, patches };
+  return { window, doc, $, click, key, posts };
 }
 
 test('the account menu: the corner opens it upward; a click outside, Escape and a route close it', async () => {
@@ -370,11 +362,12 @@ test('stylesheet: the account menu is the mockup\'s padded sheet: inset hairline
   assert.doesNotMatch(rule('.theme-ic') || '', /flex:1;/);
 });
 
-test('Keep awake in the account menu: a switch row, one source with Settings › Labs; a click PATCHes the flag and the menu stays open', async () => {
-  const { doc, $, click, patches } = await boot();
+test('Keep awake in the account menu: a switch row for the keepAwake setting; a click saves it and the menu stays open', async () => {
+  const { doc, $, click, posts } = await boot();
   const row = $('acct-keepawake');
+  const saves = () => posts.filter((p) => p.url.endsWith('/api/settings') && 'keepAwake' in p.body).map((p) => p.body);
   await checkRows([
-    { name: 'a menuitemcheckbox whose .switch is decoration, painted from GET /api/flags, with its tip', run: () => {
+    { name: 'a menuitemcheckbox whose .switch is decoration, painted from GET /api/settings, with its tip', run: () => {
       assert.deepEqual([row.getAttribute('role'), row.querySelector('.mi-lbl').textContent, row.getAttribute('aria-checked')], ['menuitemcheckbox', 'Keep awake', 'true']);
       const sw = row.querySelector('.switch');
       assert.deepEqual([sw.getAttribute('aria-hidden'), sw.hasAttribute('role'), sw.hasAttribute('tabindex')], ['true', false, false]);
@@ -382,45 +375,35 @@ test('Keep awake in the account menu: a switch row, one source with Settings ›
       assert.equal(row.getAttribute('aria-description'), row.title);
       assert.equal(row.querySelector('a'), null, 'no Beta chip link inside a menu row');
     } },
-    { name: 'a click sends PATCH {keepAwake:false}, repaints off, and the menu stays open', run: async () => {
+    { name: 'a click saves {keepAwake:false}, repaints off, and the menu stays open', run: async () => {
       click($('side-acct'));
       click(row);
       await settle();
-      assert.deepEqual(patches, [{ keepAwake: false }]);
+      assert.deepEqual(saves(), [{ keepAwake: false }]);
       assert.equal(row.getAttribute('aria-checked'), 'false');
-      assert.equal(flagOn('keepAwake', doc), false, 'the page state follows, so the Labs row repaints too');
       assert.equal($('acct-menu').hidden, false, 'a toggle leaves the menu open');
     } },
     { name: 'a keyboard click (Enter/Space on the button, detail 0) toggles it and keeps the menu open', run: async () => {
       row.focus();
       click(row, 0);
       await settle();
-      assert.deepEqual(patches.at(-1), { keepAwake: true });
+      assert.deepEqual(saves().at(-1), { keepAwake: true });
       assert.equal(row.getAttribute('aria-checked'), 'true');
       assert.equal($('acct-menu').hidden, false);
       assert.equal(doc.activeElement, row);
     } },
-    { name: 'a flags change from elsewhere (the Labs row, a flags frame) repaints the menu row', run: () => {
-      applyFlags({ keepAwake: false }, doc);
-      assert.equal(row.getAttribute('aria-checked'), 'false');
-    } },
   ]);
 });
 
-test('Keep awake in the account menu: a refused change reverts, names the error in the tip and toasts; a lock disables the row', async () => {
-  const { doc, $, click } = await boot({ flagsPatch: { status: 500, error: 'disk full' } });
+test('Keep awake in the account menu: a stored off paints off; a refused change reverts and toasts', async () => {
+  const off = await boot({ keepAwake: false });
+  assert.equal(off.$('acct-keepawake').getAttribute('aria-checked'), 'false');
+  const { doc, $, click } = await boot({ keepAwakeSave: { status: 500, error: 'disk full' } });
   const row = $('acct-keepawake');
   click(row);
   await settle();
   assert.equal(row.getAttribute('aria-checked'), 'true', 'reverted');
-  assert.match(row.title, / \(disk full\)$/);
-  assert.equal(row.getAttribute('aria-description'), row.title);
   assert.equal(doc.querySelector('.toast.err[data-key="keep-awake"] .td')?.textContent, 'disk full');
-  const locked = await boot({ keepAwake: { on: true, locked: true } });
-  const r2 = locked.$('acct-keepawake');
-  assert.equal(r2.getAttribute('aria-disabled'), 'true');
-  assert.match(r2.title, /\(Locked by WORCA_FLAGS\)$/);
-  assert.equal(locked.doc.querySelector('.toast[data-key="keep-awake"]'), null, 'a lock found at load is no toast');
 });
 
 test('stylesheet: a switch row paints its inner .switch from the row\'s aria-checked and aria-disabled, and the switch takes no pointer', () => {
@@ -429,4 +412,80 @@ test('stylesheet: a switch row paints its inner .switch from the row\'s aria-che
   assert.match(css, /\.sw-item \.switch\{pointer-events:none;\}/);
   assert.doesNotMatch(css, /\.away-item\[data-state="away"\]\{background/, 'the switch shows the state; no row tint');
   assert.doesNotMatch(css, /\.sw-item\[aria-disabled="true"\]\{cursor/, 'a disabled row keeps .mi\'s default cursor (the unread away row still opens Settings)');
+});
+
+test('the corner avatar: an image in .acct-ava keeps the ring, the dot and the data attributes; the level joins the aria-label and the title goes', async () => {
+  const { paintAccountCorner, describeAccount } = await import('../ui/public/account-menu.mjs');
+  const { $ } = await boot({ width: 1000 });
+  const btn = $('side-acct');
+  const acct = describeAccount({ name: 'ada.lovelace@acme.dev', source: 'access', shared: true });
+  const avatar = { src: '/worca-levels/pod.svg', alt: 'Pod worca' };
+  const budget = BUDGET();
+  await checkRows([
+    { name: 'avatar: an <img> with src and alt fills .acct-ava; ring, dot and data attributes stay', run: () => {
+      paintAccountCorner(btn, acct, { budget, avatar });
+      const img = btn.querySelector('.acct-ava img');
+      assert.ok(img, 'the image is in the avatar circle');
+      assert.deepEqual([img.getAttribute('src'), img.getAttribute('alt')], [avatar.src, avatar.alt]);
+      assert.equal(btn.querySelector('.acct-ava').textContent, '', 'no initials beside the image');
+      assert.ok(btn.querySelector('.acct-ring-wrap .acct-ring') && btn.querySelector('.acct-ring-wrap .acct-dot'), 'ring and dot markup unchanged');
+      assert.deepEqual([btn.dataset.spend, btn.dataset.presence], ['ok', 'here']);
+      paintAccountCorner(btn, acct, { budget, avatar, away: true });
+      assert.equal(btn.dataset.presence, 'away');
+    } },
+    { name: 'avatar: no native title; aria-label keeps the spend text and adds the level name', run: () => {
+      paintAccountCorner(btn, acct, { budget, avatar });
+      assert.equal(btn.hasAttribute('title'), false);
+      const label = btn.getAttribute('aria-label');
+      assert.match(label, /ada\.lovelace@acme\.dev/);
+      assert.match(label, /\$20(\.00)? of \$50(\.00)? spent/);
+      assert.match(label, /Pod worca/);
+    } },
+    { name: 'repainting the same avatar keeps the same <img> node', run: () => {
+      paintAccountCorner(btn, acct, { budget, avatar });
+      const img = btn.querySelector('.acct-ava img');
+      paintAccountCorner(btn, acct, { budget, avatar: { ...avatar } });
+      assert.equal(btn.querySelector('.acct-ava img'), img);
+    } },
+    { name: 'avatar: data-worca-level carries the level key on .acct-ava; no level text or badge joins .acct', run: () => {
+      const keyed = { ...avatar, key: 'runner' };
+      paintAccountCorner(btn, acct, { budget, avatar: keyed });
+      const ava = btn.querySelector('.acct-ava');
+      assert.equal(ava.getAttribute('data-worca-level'), 'runner');
+      assert.equal(ava.querySelector('img').getAttribute('src'), avatar.src);
+      assert.equal(btn.querySelector('.acct-name').textContent, acct.short, 'the name stays the only text');
+      assert.equal(ava.children.length, 1, 'the image is the only child');
+      assert.doesNotMatch(btn.textContent, /Level|Pod worca|Runner/, 'no level text inside .acct');
+      assert.equal(btn.querySelector('.acct-ring').closest('.acct-ava'), null, 'the ring is a sibling outside the avatar');
+      assert.equal(btn.querySelector('.acct-dot').closest('.acct-ava'), null, 'the dot is outside the avatar');
+    } },
+    { name: 'avatar: without a key the level key comes from the art file name; with no avatar the attribute goes', run: () => {
+      paintAccountCorner(btn, acct, { budget, avatar: { src: '/assets/worca-levels/hooked.svg', alt: 'Hooked' } });
+      assert.equal(btn.querySelector('.acct-ava').getAttribute('data-worca-level'), 'hooked');
+      paintAccountCorner(btn, acct, { budget, avatar: null });
+      assert.equal(btn.querySelector('.acct-ava').hasAttribute('data-worca-level'), false);
+    } },
+    { name: 'avatar null: initials and the native title as before, after an image was shown', run: () => {
+      paintAccountCorner(btn, acct, { budget, avatar });
+      paintAccountCorner(btn, acct, { budget, avatar: null });
+      assert.equal(btn.querySelector('.acct-ava img'), null);
+      assert.equal(btn.querySelector('.acct-ava').textContent, acct.initials);
+      assert.ok(btn.title.startsWith('ada.lovelace@acme.dev'));
+      assert.doesNotMatch(btn.getAttribute('aria-label'), /Pod worca/);
+    } },
+  ]);
+});
+
+test('stylesheet: the avatar image fills the 30px circle and the dot stacks above it', () => {
+  const rule = (sel) => { const m = css.match(new RegExp(`(?:^|[\\s,}])${sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{([^}]*)\\}`)); return m ? m[1] : null; };
+  assert.match(rule('.acct-ava img') || '', /width:100%;height:100%;/);
+  assert.match(rule('.acct-ava img') || '', /border-radius:50%;/);
+  assert.match(rule('.acct-ava img') || '', /object-fit:cover;/);
+  assert.match(rule('.acct-dot') || '', /z-index:1;/);
+});
+
+test('stylesheet: the collapsed rail keeps the level image in the avatar circle', () => {
+  assert.match(css, /\.acct-ava img\{[^}]*width:100%;[^}]*height:100%;/, 'the image fills the circle');
+  assert.doesNotMatch(css, /\.sidebar\.collapsed [^{]*\.acct-ava img[^{]*\{[^}]*display:none/, 'the rail never hides it');
+  assert.doesNotMatch(css, /\.sidebar\.collapsed [^{]*\.acct-ava[^{]*\{[^}]*display:none/);
 });

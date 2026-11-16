@@ -131,7 +131,7 @@ test('HTTP: GET shape, PATCH true/false/null, 400/409, the flags frame, hello an
     await checkRows([
       { name: 'hello carries flags', run: async () => {
         await waitFor(() => msgs.some((m) => m.type === 'hello'));
-        assert.deepEqual(msgs.find((m) => m.type === 'hello').flags, { flagsDemo: false, keepAwake: true, shapeFirst: true, runTags: false, runPresets: true, commandSummaries: true, runLabels: false, smartRunNaming: false, requirements: false, runTelemetry: false });
+        assert.deepEqual(msgs.find((m) => m.type === 'hello').flags, { flagsDemo: false, commandSummaries: true, runLabels: false, smartRunNaming: false, proposedPerspectives: false, requirements: false, runTelemetry: false, gitAutomations: false, sessionGroups: false, ticketUpdates: false, rail: false, design: true });
       } },
       { name: 'GET /api/flags: the documented shape, plus docsUrl', run: async () => {
         const j = await (await fetch(`${base}/api/flags`)).json();
@@ -145,27 +145,19 @@ test('HTTP: GET shape, PATCH true/false/null, 400/409, the flags frame, hello an
         assert.equal((await r.json()).flags.find((f) => f.key === 'flagsDemo').on, true);
         assert.deepEqual(await stored(), { flagsDemo: true });
         await waitFor(() => msgs.some((m) => m.type === 'flags'));
-        assert.deepEqual(msgs.filter((m) => m.type === 'flags').at(-1), { type: 'flags', flags: { flagsDemo: true, keepAwake: true, shapeFirst: true, runTags: false, runPresets: true, commandSummaries: true, runLabels: false, smartRunNaming: false, requirements: false, runTelemetry: false } });
-        assert.match(await (await fetch(`${base}/`)).text(), /data-flags="flagsDemo keepAwake shapeFirst runPresets commandSummaries"/);
+        assert.deepEqual(msgs.filter((m) => m.type === 'flags').at(-1), { type: 'flags', flags: { flagsDemo: true, commandSummaries: true, runLabels: false, smartRunNaming: false, proposedPerspectives: false, requirements: false, runTelemetry: false, gitAutomations: false, sessionGroups: false, ticketUpdates: false, rail: false, design: true } });
+        assert.match(await (await fetch(`${base}/`)).text(), /data-flags="flagsDemo commandSummaries design"/);
         assert.equal((await (await fetch(`${base}/api/settings`)).json()).flags.flagsDemo, true);
       } },
-      { name: 'PATCH {keepAwake:false} (the Settings › Runs switch) turns it off and broadcasts; null restores the default', run: async () => {
-        const r = await patch({ keepAwake: false });
-        assert.equal(r.status, 200);
-        assert.equal((await r.json()).flags.find((f) => f.key === 'keepAwake').on, false);
-        await waitFor(() => msgs.some((m) => m.type === 'flags' && m.flags.keepAwake === false));
-        assert.equal((await patch({ keepAwake: null })).status, 200);
-        assert.equal((await (await fetch(`${base}/api/flags`)).json()).flags.find((f) => f.key === 'keepAwake').on, true);
-      } },
-      { name: 'shapeFirst is beta and on by default; a stored false (the Settings › Labs switch) is respected; null restores it', run: async () => {
-        const row = () => fetch(`${base}/api/flags`).then((r) => r.json()).then((j) => j.flags.find((f) => f.key === 'shapeFirst'));
+      { name: 'a beta flag on by default (commandSummaries): a stored false is respected; null restores it', run: async () => {
+        const row = () => fetch(`${base}/api/flags`).then((r) => r.json()).then((j) => j.flags.find((f) => f.key === 'commandSummaries'));
         assert.deepEqual(await row().then((f) => [f.stage, f.on, f.source]), ['beta', true, 'default']);
-        assert.equal((await patch({ shapeFirst: false })).status, 200);
-        assert.equal((await stored()).shapeFirst, false, 'an explicit off is the one value kept');
+        assert.equal((await patch({ commandSummaries: false })).status, 200);
+        assert.equal((await stored()).commandSummaries, false, 'an explicit off is the one value kept');
         assert.deepEqual(await row().then((f) => [f.on, f.source]), [false, 'settings']);
-        await waitFor(() => msgs.some((m) => m.type === 'flags' && m.flags.shapeFirst === false));
-        assert.equal((await patch({ shapeFirst: null })).status, 200);
-        assert.equal((await stored())?.shapeFirst, undefined);
+        await waitFor(() => msgs.some((m) => m.type === 'flags' && m.flags.commandSummaries === false));
+        assert.equal((await patch({ commandSummaries: null })).status, 200);
+        assert.equal((await stored())?.commandSummaries, undefined);
         assert.deepEqual(await row().then((f) => [f.on, f.source]), [true, 'default']);
       } },
       { name: 'PATCH false and null both leave nothing stored (default false)', run: async () => {
@@ -222,4 +214,38 @@ test('GET /api/flags lists commandSummaries as beta, on with no override', async
   const f = flags.find((x) => x.key === 'commandSummaries');
   assert.equal(f.stage, 'beta');
   assert.equal(f.on, true);
+});
+
+test('HTTP: rail on stores onboarding.stillhetAsked after the flag; off changes only flags.rail; other flags store no answer', async () => {
+  const file = async () => JSON.parse(await readFile(settingsFile(), 'utf8'));
+  await patch({ rail: null });
+  const before = await file().catch(() => ({}));
+  assert.equal((await patch({ flagsDemo: true })).status, 200);
+  assert.equal((await file()).onboarding?.stillhetAsked, undefined, 'another flag stores no answer');
+  await patch({ flagsDemo: null });
+  assert.equal((await patch({ rail: true })).status, 200);
+  const on = await file();
+  assert.equal(on.flags.rail, true);
+  assert.equal(on.onboarding.stillhetAsked, true);
+  const { flags: _f, onboarding: _o, ...restOn } = on, { flags: _f2, onboarding: _o2, ...restBefore } = before;
+  assert.deepEqual(restOn, restBefore, 'every other key is untouched');
+  assert.equal((await patch({ rail: false })).status, 200);
+  const off = await file();
+  assert.equal(off.flags?.rail, undefined);
+  assert.equal(off.onboarding.stillhetAsked, true, 'turning off stores nothing else');
+});
+
+test('HTTP: a locked rail answers 409 and stores no answer', async () => {
+  await patch({ rail: null });
+  const f = JSON.parse(await readFile(settingsFile(), 'utf8').catch(() => '{}'));
+  delete f.onboarding;
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(settingsFile(), JSON.stringify(f));
+  process.env.WORCA_FLAGS = 'rail';
+  try {
+    const r = await patch({ rail: false });
+    assert.equal(r.status, 409);
+    assert.equal((await r.json()).code, 'locked');
+    assert.equal(JSON.parse(await readFile(settingsFile(), 'utf8')).onboarding?.stillhetAsked, undefined);
+  } finally { delete process.env.WORCA_FLAGS; }
 });

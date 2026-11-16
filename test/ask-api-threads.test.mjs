@@ -589,6 +589,7 @@ test('show_files copies on the attachment route: an SVG gets the sandbox CSP; ?a
     { name: 'shared sign-in: another person gets 404 on ?as=text, the owner gets 200', run: async () => {
       const prev = process.env.WORCA_IDENTITY_HEADER;
       process.env.WORCA_IDENTITY_HEADER = 'x-test-user';
+      process.env.WORCA_IDENTITY_TRUSTED_PROXIES = '127.0.0.1,::1';   // X1: the in-process server's callers are loopback
       try {
         const t = store.createThread({ createdBy: 'bob@example.com' });
         const md = store.addAttachment(t.id, null, { name: 'r.md', kind: 'text', mime: 'text/markdown', text: 'mine' });
@@ -640,6 +641,7 @@ test('Show in folder: GET /api/ask/reveal says whether a folder opens here; the 
     { name: 'shared sign-in: another person gets 404', run: async () => {
       const prev = process.env.WORCA_IDENTITY_HEADER;
       process.env.WORCA_IDENTITY_HEADER = 'x-test-user';
+      process.env.WORCA_IDENTITY_TRUSTED_PROXIES = '127.0.0.1,::1';   // X1: the in-process server's callers are loopback
       try {
         const t = store.createThread({ createdBy: 'bob@example.com' });
         const up = store.addAttachment(t.id, null, { name: 'a.md', text: 'a' });
@@ -862,4 +864,104 @@ test('#948 s2: PATCH archived / pinned validation, the paged list shapes, Show =
       assert.equal((await (await fetch(`${base}/api/ask/threads/${thread.id}`)).json()).thread.archivedAt, null);
     } },
   ]);
+});
+
+test('the list says what each chat did: runs it started from a card, runs it only tracked (a re-track keeps a started run started), a workflow card in any state', async () => {
+  const store = await import('../src/core/ask/store.mjs');
+  const { seedPipeline } = await import('./helpers/db-seed.mjs');
+  const dir = await mkdtemp(join(tmpdir(), 'worca-cc-askthreads-kind-'));
+  try {
+    const { id: startedPid } = await seedPipeline(dir, { title: 'Started run', status: 'done', steps: [] });
+    const { id: trackedPid } = await seedPipeline(dir, { title: 'Tracked run', status: 'done', steps: [] });
+    const plain = store.createThread({ title: 'kind plain' });
+    // A run card's launch links WITH the card id (POST /api/run); a later track_run of that run only patches the row.
+    const started = store.createThread({ title: 'kind started' });
+    store.linkRun(started.id, { runId: 'uuid-KIND-START', pipelineId: startedPid, cardId: 'card_0000aa01', status: 'running' });
+    assert.equal(mod._testing.askTrackRun(started.id, { id: startedPid }, null).ok, true);
+    assert.deepEqual(store.listRunLinks(started.id).map((l) => l.cardId), ['card_0000aa01'], 'one row, its card id kept');
+    const tracked = store.createThread({ title: 'kind tracked' });
+    assert.equal(mod._testing.askTrackRun(tracked.id, { id: trackedPid }, null).ok, true);
+    const both = store.createThread({ title: 'kind both' });
+    store.linkRun(both.id, { runId: 'uuid-KIND-BOTH', pipelineId: startedPid, cardId: 'card_0000aa02', status: 'done' });
+    assert.equal(mod._testing.askTrackRun(both.id, { id: trackedPid }, null).ok, true);
+    const withBlocks = (title, blocks) => {
+      const t = store.createThread({ title });
+      store.appendMessage(t.id, { role: 'user', text: 'go' });
+      store.appendMessage(t.id, { role: 'assistant', text: '', blocks });
+      return t;
+    };
+    const declined = withBlocks('kind workflow', [{ kind: 'text', text: 'Here.' },
+      { kind: 'card', id: 'card_0000bb01', state: 'declined', card: { type: 'workflow', mode: 'task', name: 'Review loop' } }]);
+    const built = withBlocks('kind build', [{ kind: 'card', id: 'card_0000bb02', state: 'applied', card: { type: 'workflow-build', name: 'Docs' } }]);
+    // Neither a tool row that merely holds `"type":"workflow"` nor a run card (it names a workflowId) is a workflow card.
+    const lookalike = withBlocks('kind lookalike', [{ kind: 'tool', id: 'toolu_1', name: 'edit_canvas', input: { type: 'workflow' } },
+      { kind: 'card', id: 'card_0000bb03', state: 'proposed', card: { workflowId: 'wf_default', title: 'Fix it' } },
+      { kind: 'card', id: 'card_0000bb04', state: 'proposed', card: { type: 'workflows', summary: 'not this one' } }]);
+    const facts = (t) => t && { startedRuns: t.startedRuns, trackedRuns: t.trackedRuns, hasWorkflowCard: t.hasWorkflowCard, runLinks: t.runLinks };
+    for (const url of ['/api/ask/threads?limit=200', '/api/ask/threads?show=all&limit=200', '/api/ask/threads?q=kind&limit=200']) {
+      const { threads } = await (await fetch(`${base}${url}`)).json();
+      const of = (t) => facts(threads.find((x) => x.id === t.id));
+      assert.deepEqual(of(plain), { startedRuns: 0, trackedRuns: 0, hasWorkflowCard: false, runLinks: 0 }, url);
+      assert.deepEqual(of(started), { startedRuns: 1, trackedRuns: 0, hasWorkflowCard: false, runLinks: 1 }, `${url}: a re-tracked started run stays started`);
+      assert.deepEqual(of(tracked), { startedRuns: 0, trackedRuns: 1, hasWorkflowCard: false, runLinks: 1 }, url);
+      assert.deepEqual(of(both), { startedRuns: 1, trackedRuns: 1, hasWorkflowCard: false, runLinks: 2 }, url);
+      assert.deepEqual(of(declined), { startedRuns: 0, trackedRuns: 0, hasWorkflowCard: true, runLinks: 0 }, `${url}: a declined card counts`);
+      assert.deepEqual(of(built), { startedRuns: 0, trackedRuns: 0, hasWorkflowCard: true, runLinks: 0 }, `${url}: build_workflow's card`);
+      assert.deepEqual(of(lookalike), { startedRuns: 0, trackedRuns: 0, hasWorkflowCard: false, runLinks: 0 }, url);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('GET /api/ask/threads: a chat a chat integration opened carries its origin (paged and unpaged); an app chat has origin null', async () => {
+  const store = await import('../src/core/ask/store.mjs');
+  const C = await import('../src/core/chat/conversations.mjs');
+  const app = store.createThread({ title: 'App chat' });
+  const tg = store.createThread({ title: 'From Telegram' });
+  C.createConversation({ plugin: 'telegram-chat', channelId: 'main', platform: 'telegram', parentChatId: 'C9', chatId: `T-${tg.id}`,
+    ownerUserId: 'U9', worcaIdentity: 'local', askThreadId: tg.id });
+  for (const q of ['?limit=200', '?show=all&limit=200']) {
+    const { threads } = await (await fetch(`${base}/api/ask/threads${q}`)).json();
+    const row = (id) => threads.find((t) => t.id === id);
+    assert.deepEqual(row(tg.id).origin, { plugin: 'telegram-chat', channelId: 'main', platform: 'telegram', label: null }, q);
+    assert.equal(row(app.id).origin, null, q);
+  }
+});
+
+test('chat labels: PUT /api/ask/threads/:id/labels sets and clears them with run labels\' rules; GET /api/ask/labels lists those in use', async () => {
+  const put = (id, body) => fetch(`${base}/api/ask/threads/${id}/labels`, { method: 'PUT', headers: JSONH, body: JSON.stringify(body) });
+  const { thread: a } = await (await post('/api/ask/threads', { title: 'labels-a' })).json();
+  const { thread: b } = await (await post('/api/ask/threads', { title: 'labels-b' })).json();
+  assert.deepEqual(a.labels, [], 'a new chat has none');
+  const before = (await (await fetch(`${base}/api/ask/threads/${a.id}`)).json()).thread.updatedAt;
+  let r = await put(a.id, { labels: ['  Hotfix ', 'billing', 'hotfix'] });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { labels: ['hotfix', 'billing'], changed: true }, 'normalised and deduped as run labels are');
+  assert.deepEqual(await (await put(a.id, { labels: ['hotfix', 'billing'] })).json(), { labels: ['hotfix', 'billing'], changed: false });
+  await put(b.id, { labels: ['billing'] });
+  // persists: a re-read (the page after a reload) and the list both carry them; labelling never bumps Last activity
+  const got = (await (await fetch(`${base}/api/ask/threads/${a.id}`)).json()).thread;
+  assert.deepEqual(got.labels, ['hotfix', 'billing']);
+  assert.equal(got.updatedAt, before);
+  const list = (await (await fetch(`${base}/api/ask/threads?show=all`)).json()).threads;
+  assert.deepEqual(list.find((t) => t.id === a.id).labels, ['hotfix', 'billing']);
+  const vocab = (await (await fetch(`${base}/api/ask/labels`)).json()).labels;
+  assert.deepEqual(vocab.filter((l) => ['hotfix', 'billing'].includes(l.label)), [{ label: 'billing', count: 2 }, { label: 'hotfix', count: 1 }]);
+  // the same refusals as PUT /api/runs/:id/labels
+  for (const [body, msg] of [[{}, /labels must be a list of strings/], [{ labels: [7] }, /a label must be a string/], [{ labels: ['x'.repeat(33)] }, /at most 32 characters/], [{ labels: [''] }, /a label needs a word/]]) {
+    r = await put(a.id, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.match((await r.json()).error, msg);
+  }
+  assert.equal((await put('ask_0000beef', { labels: ['x'] })).status, 404);
+  assert.equal((await put('nope', { labels: ['x'] })).status, 400);
+  // clearing
+  assert.deepEqual(await (await put(a.id, { labels: [] })).json(), { labels: [], changed: true });
+  assert.deepEqual((await (await fetch(`${base}/api/ask/threads/${a.id}`)).json()).thread.labels, []);
+  const after = (await (await fetch(`${base}/api/ask/labels`)).json()).labels;
+  assert.equal(after.find((l) => l.label === 'hotfix'), undefined, 'a label on no chat leaves the list');
+  // an archived chat's labels are not offered
+  await patch(`/api/ask/threads/${b.id}`, { archived: true });
+  assert.equal((await (await fetch(`${base}/api/ask/labels`)).json()).labels.find((l) => l.label === 'billing'), undefined);
 });

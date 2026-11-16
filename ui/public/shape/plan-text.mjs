@@ -1,6 +1,8 @@
 // ui/public/shape/plan-text.mjs — pure helpers of the plan and question cards (spec §3.3, §3.4).
 import { SECTIONS, perspectiveByKey, ownersOf, splitSections } from '../../../src/shared/shape/perspectives.mjs';
 import { askKindOf } from '../ask/registry.mjs';
+// the plan's fix and coverage words live in src/shared (Stillhet's live PlanCard reads them too)
+export { fixFeedback, fixAllFeedback, displayCoverage } from '../../../src/shared/shape/plan-fix.mjs';
 
 export const SHAPE_ATTENTION = '~3 min of your time now';
 
@@ -24,10 +26,6 @@ export function perspectiveChangeFeedback(before, after) {
   if (dropped.length) parts.push(`drop ${list(dropped)}`);
   return `Perspectives changed: ${parts.join('; ')}. Rewrite the plan for ${list(after)}: every section and checklist `
     + 'each picked perspective owns, and nothing for a dropped one.';
-}
-
-export function fixFeedback(item) {
-  return `The shape check fails "${item.label}"${item.detail ? `: ${item.detail}` : ''}. Fix the plan so this check passes.`;
 }
 
 /** The perspectives that own a `## <title>` section (perspective tags on the plan, spec §3.4). */
@@ -81,19 +79,18 @@ export function checkLine(check, name = 'Shape') {
   return n ? `${score} · ${n} to fix` : score;
 }
 
+/** A shaping round's coverage counts `{ passed, total }` as a check for `checkLine`: `total - passed` failing rows. */
+export function roundCheck(cov) {
+  if (!cov || !Number.isInteger(cov.passed) || !Number.isInteger(cov.total) || cov.total < 1 || cov.total < cov.passed) return null;
+  return { passed: cov.passed, total: cov.total,
+    items: Array.from({ length: cov.total }, (_, i) => ({ id: `r${i + 1}`, label: `r${i + 1}`, pass: i < cov.passed })) };
+}
+
 /** "Still to fix: missing sections, no test plan" — under the buttons when the check fails (D32). */
 export function unmetLine(check) {
   const bad = failing(check);
   if (!bad.length) return '';
   return `Still to fix: ${bad.map((it) => UNMET_WORDS[it.id] || it.label || it.id).join(', ')}`;
-}
-
-/** One revise for every failing check (D32 "Fix all"); a single failure reads as today's fixFeedback. */
-export function fixAllFeedback(items) {
-  const bad = (Array.isArray(items) ? items : []).filter((it) => !it.pass);
-  if (bad.length === 1) return fixFeedback(bad[0]);
-  return `The shape check fails ${bad.length} checks:\n${bad.map((it) => `- "${it.label}"${it.detail ? `: ${it.detail}` : ''}`).join('\n')}\n`
-    + 'Fix the plan so these checks pass.';
 }
 
 /** The plan card's primary names its outcome, never "anyway" (D32); every plan approval starts a build (the split is
